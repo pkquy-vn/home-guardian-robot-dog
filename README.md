@@ -1,13 +1,14 @@
 # Home Guardian
 
 [![Firmware build](https://github.com/pkquy-vn/home-guardian-robot-dog/actions/workflows/firmware.yml/badge.svg)](https://github.com/pkquy-vn/home-guardian-robot-dog/actions/workflows/firmware.yml)
+[![ROS 2 build](https://github.com/pkquy-vn/home-guardian-robot-dog/actions/workflows/ros2.yml/badge.svg)](https://github.com/pkquy-vn/home-guardian-robot-dog/actions/workflows/ros2.yml)
 
 Home Guardian is a custom 8-DOF quadruped robot being built for autonomous indoor patrol. A
 Raspberry Pi 5 runs the high-level software on ROS 2 Jazzy, and a Teensy 4.1 runs the real-time
 controller; the two talk over a framed binary serial link. The project is at an early stage: this
 repository currently contains the serial protocol, minimal Teensy firmware that exchanges
-heartbeat and status messages with the Pi, a link test tool and a host-side protocol test. The
-ROS 2 packages are planned but not written yet.
+heartbeat and status messages with the Pi, the `hg_teensy_bridge` ROS 2 package, a link test
+tool and a host-side protocol test. The other ROS 2 packages are planned but not written yet.
 
 ## Architecture
 
@@ -15,7 +16,7 @@ ROS 2 packages are planned but not written yet.
 | --- | --- | --- |
 | Role | High-level computer | Real-time controller |
 | Software | Ubuntu Server 24.04, ROS 2 Jazzy | Bare-metal Arduino-framework firmware, built with PlatformIO |
-| Today | Runs `tools/test_link.py` | Heartbeat watchdog, 10 Hz status, status LED |
+| Today | `hg_teensy_bridge` (heartbeat and status), `tools/test_link.py` | Heartbeat watchdog, 10 Hz status, status LED |
 | Planned | Localization, navigation, docking, perception, events, audio, behavior (ROS 2) | Joint control and gaits; joint state, IMU, odometry, foot contact and battery data |
 
 ### Serial link
@@ -36,7 +37,9 @@ Every message is one frame; all multi-byte fields are little-endian:
 | last 2 | CRC | CRC-16/CCITT-FALSE (poly `0x1021`, init `0xFFFF`) over type, length and payload |
 
 The C++ implementation is [`common/include/protocol.h`](common/include/protocol.h) (header-only,
-no Arduino dependencies); [`tools/test_link.py`](tools/test_link.py) mirrors it in Python. The
+no Arduino dependencies). Its single Python mirror is
+[`hg_teensy_bridge/protocol.py`](ros2_ws/src/hg_teensy_bridge/hg_teensy_bridge/protocol.py), used
+by the ROS 2 bridge and by `tools/test_link.py`. The
 receiving parser rejects and counts frames with a bad CRC or length and resynchronizes on the
 next start byte.
 
@@ -66,7 +69,7 @@ at 1 Hz while the link is OK and at 5 Hz while the heartbeat is lost.
 
 ```
 .
-├── .github/workflows/   CI: protocol host test and firmware build
+├── .github/workflows/   CI: protocol host test, firmware build, ROS 2 colcon build
 ├── cad/                 Mechanical design (SpotMicro-derived); attribution and license notes
 ├── common/
 │   ├── include/         Code shared by the firmware and the Pi side (protocol.h)
@@ -75,7 +78,7 @@ at 1 Hz while the link is OK and at 5 Hz while the heartbeat is lost.
 │   ├── decisions/       Architecture decision records
 │   └── setup/           How the Raspberry Pi was set up
 ├── firmware/            PlatformIO project for the Teensy 4.1
-├── ros2_ws/src/         colcon workspace (empty; packages planned)
+├── ros2_ws/src/         colcon workspace: hg_teensy_bridge (other packages planned)
 └── tools/               Pi-side utilities (test_link.py)
 ```
 
@@ -83,7 +86,7 @@ at 1 Hz while the link is OK and at 5 Hz while the heartbeat is lost.
 
 On the Raspberry Pi (details in [docs/setup/raspberry-pi.md](docs/setup/raspberry-pi.md)):
 
-- Ubuntu Server 24.04 and ROS 2 Jazzy (ROS 2 is not needed by anything in the repository yet)
+- Ubuntu Server 24.04 and ROS 2 Jazzy (`ros-base` and `ros-dev-tools`) for `hg_teensy_bridge`
 - [PlatformIO Core](https://docs.platformio.org/en/latest/core/installation/index.html) (`pio`)
 - PJRC and PlatformIO udev rules, your user in the `dialout` group, ModemManager disabled
 - Python 3 with pyserial: `sudo apt install python3-serial`
@@ -135,6 +138,49 @@ and the CRC error count. Fault bits should read `0x0000 (none)` and the Teensy L
 at 1 Hz. After you stop the script, the LED should switch to 5 Hz within about half a second.
 Only one program can use the serial port at a time, so close any serial monitor first.
 
+## ROS 2: hg_teensy_bridge
+
+The `teensy_bridge` node owns the serial link on the Pi: it sends HEARTBEAT and publishes what
+the Teensy reports in STATUS. Only one program can use the port, so do not run
+`tools/test_link.py` at the same time.
+
+The heartbeat is sent from a timer on the node's executor, never from a separate thread: if the
+node stalls or is stopped, heartbeats stop and the Teensy raises `HEARTBEAT_LOST` within 500 ms.
+If the port is missing or disappears (USB re-enumeration, reflash), the node logs it once,
+retries every second and recovers on its own.
+
+Build (on the Pi, from the repository root):
+
+```bash
+source /opt/ros/jazzy/setup.bash
+```
+
+```bash
+cd ros2_ws && rosdep install --from-paths src --ignore-src -y && colcon build --symlink-install
+```
+
+Run:
+
+```bash
+source install/setup.bash
+```
+
+```bash
+ros2 launch hg_teensy_bridge bridge.launch.py
+```
+
+Parameters (launch arguments of the same name): `port` (default `/dev/ttyACM0`), `baud`
+(`115200`, ignored by USB serial), `heartbeat_rate_hz` (`20.0`), `status_timeout_s` (`0.5`).
+With `ros2 run`, give the float parameters a decimal point, for example
+`-p heartbeat_rate_hz:=20.0`.
+
+| Topic | Type | Content |
+| --- | --- | --- |
+| `/teensy/mode` | `std_msgs/UInt8` | STATUS mode, on every STATUS (about 10 Hz) |
+| `/teensy/faults` | `std_msgs/UInt16` | STATUS fault bits (bit 0 `HEARTBEAT_LOST`), on every STATUS |
+| `/teensy/connected` | `std_msgs/Bool` | True while STATUS arrived within `status_timeout_s`; 2 Hz and on change |
+| `/diagnostics` | `diagnostic_msgs/DiagnosticArray` | 1 Hz: link state, STATUS rate, mode, decoded faults, CRC errors, heartbeats sent |
+
 ## Project status
 
 **Works today**
@@ -145,16 +191,17 @@ Only one program can use the serial port at a time, so close any serial monitor 
 - Firmware: HEARTBEAT watchdog (500 ms), STATUS at 10 Hz, status LED. Built by CI on every push
   and pull request.
 - `tools/test_link.py`: heartbeat sender and STATUS monitor.
+- `hg_teensy_bridge`: ROS 2 node for HEARTBEAT and STATUS. Built with colcon in CI.
 
 **Not yet verified on hardware**
 
-- The firmware and link test in this repository have not yet been run against a Teensy.
+- The firmware, the link test and `hg_teensy_bridge` have not yet been run against a Teensy.
 
 **Next**
 
 - Run the firmware and link test on the robot.
 - Define payloads for the reserved message types.
-- ROS 2 packages: `hg_msgs`, `hg_teensy_bridge`, `hg_description`, `hg_bringup`,
+- ROS 2 packages: `hg_msgs`, `hg_description`, `hg_bringup`,
   `hg_localization`, `hg_navigation`, `hg_docking`, `hg_perception`, `hg_events`, `hg_audio`,
   `hg_behavior`, `hg_sim`.
 - Move the link to the hardware UART once a taller stacking header is fitted (ADR 0001).

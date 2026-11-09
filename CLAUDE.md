@@ -6,12 +6,14 @@ Guidance for Claude Code (and anyone else) working in this repository.
 
 Home Guardian is a custom 8-DOF quadruped robot for autonomous indoor patrol.
 
-- **Raspberry Pi 5 (8 GB):** Ubuntu Server 24.04, ROS 2 Jazzy. High-level software. The ROS 2
-  packages (`hg_*`) are planned but not written yet; `ros2_ws/src/` is empty.
+- **Raspberry Pi 5 (8 GB):** Ubuntu Server 24.04, ROS 2 Jazzy. High-level software.
+  `ros2_ws/src/hg_teensy_bridge` (ament_python) owns the serial link; the other `hg_*` packages
+  are planned but not written yet.
 - **Teensy 4.1:** bare-metal Arduino-framework firmware built with PlatformIO
   (`firmware/`). Real-time controller. Connected to the Pi over USB as `/dev/ttyACM0`.
 - **Link:** framed binary serial protocol, `0xA5 | type | length | payload | CRC-16/CCITT-FALSE`
-  (little-endian). Defined in `common/include/protocol.h`, mirrored in Python in
+  (little-endian). Defined in `common/include/protocol.h`; the single Python mirror is
+  `ros2_ws/src/hg_teensy_bridge/hg_teensy_bridge/protocol.py`, used by the bridge node and
   `tools/test_link.py`. USB serial for now; hardware UART deferred
   (`docs/decisions/0001-usb-serial-link.md`).
 - Implemented message types: HEARTBEAT (Pi → Teensy) and STATUS (Teensy → Pi). All other IDs are
@@ -35,11 +37,10 @@ pio run -d firmware -t upload               # upload firmware: ASK FIRST
 python3 tools/test_link.py /dev/ttyACM0     # live link test against the Teensy
 ```
 
-ROS 2 (once packages exist): `source /opt/ros/jazzy/setup.bash`, then `colcon build` and
-`colcon test` in `ros2_ws/`.
+ROS 2: `source /opt/ros/jazzy/setup.bash`, then `colcon build --symlink-install` in `ros2_ws/`.
 
-CI (`.github/workflows/firmware.yml`) runs the host protocol test and `pio run` on every push and
-pull request.
+CI runs on every push and pull request: `firmware.yml` (host protocol test, `pio run`) and
+`ros2.yml` (`colcon build` in the `ros:jazzy-ros-base` container).
 
 ## Conventions
 
@@ -50,8 +51,11 @@ pull request.
   `kPascalCase`, everything shared in namespace `hg`.
 - **Python:** 4-space indent, 100 columns. Tools use the standard library plus pyserial only.
 - **Protocol changes:** `protocol.h` is the source of truth. Any change must be mirrored in
-  `tools/test_link.py`, covered in `common/test/test_protocol.py`, and reflected in the message
-  table in `README.md`. Multi-byte fields are little-endian; payloads are at most 64 bytes.
+  `hg_teensy_bridge/protocol.py` (the only Python implementation), covered in
+  `common/test/test_protocol.py`, and reflected in the message table in `README.md`. Multi-byte fields are little-endian; payloads are at most 64 bytes.
+- **Bridge heartbeat:** `teensy_bridge` sends HEARTBEAT from a timer on its executor, in the
+  default callback group. Never move it to a separate thread or callback group: a stalled node
+  must stop the heartbeat so the Teensy watchdog trips.
 - **Firmware:** the main loop must never block (no `delay()`, no `while (!Serial)`). The serial
   port for the link is chosen by the `LINK` macro in `firmware/src/main.cpp`.
 - **Decisions:** record significant decisions as ADRs in `docs/decisions/NNNN-title.md`.
