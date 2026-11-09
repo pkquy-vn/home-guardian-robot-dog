@@ -1,0 +1,122 @@
+# Home Guardian: root ignore rules for the whole monorepo.
+# This repository is PUBLIC. Anything secret or personal must never be committed; if you
+# really need to add an ignored file on purpose, use `git add -f` and think twice.
+
+# ---------------------------------------------------------------------------------------------
+# Build output
+# ---------------------------------------------------------------------------------------------
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# colcon / ROS 2 workspace
+build/
+install/
+log/
+
+# Host-side C/C++ objects
+*.o
+*.obj
+
+# ---------------------------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# ---------------------------------------------------------------------------------------------
+# Editors and OS files
+# ---------------------------------------------------------------------------------------------
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+.#*
+\#*\#
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------------------------------------------------------------------------------------------
+# Secrets and credentials
+# ---------------------------------------------------------------------------------------------
+# Environment files (commit a sanitized .env.example instead)
+.env
+.env.*
+!.env.example
+*.env
+
+# Service credentials and API tokens
+telegram.yaml
+telegram.yml
+mqtt.yaml
+mqtt.yml
+secrets/
+secrets.*
+*.secret
+*.token
+api_token*
+api_key*
+
+# Wi-Fi credentials
+wpa_supplicant*.conf
+*.nmconnection
+wifi.yaml
+wifi.conf
+wifi_credentials*
+50-cloud-init.yaml
+netplan/
+
+# SSH keys and certificates
+id_rsa*
+id_dsa*
+id_ecdsa*
+id_ed25519*
+*.pem
+*.key
+*.p12
+*.pfx
+authorized_keys
+known_hosts
+
+# ---------------------------------------------------------------------------------------------
+# Personal data recorded by the robot
+# ---------------------------------------------------------------------------------------------
+# Face-enrollment images
+faces/
+face_db/
+enrollment/
+
+# Maps of the home
+maps/
+*.pgm
+
+# Event databases
+*.db
+*.db3
+*.sqlite
+*.sqlite3
+
+# Recorded clips, snapshots and ROS bags (camera and audio from inside the home)
+clips/
+recordings/
+snapshots/
+rosbag2_*/
+*.bag
+*.mcap
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.h264
+*.h265
