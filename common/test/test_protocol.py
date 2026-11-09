@@ -3,7 +3,8 @@
 """Host-side cross-check of the two protocol implementations.
 
 Compiles common/test/protocol_tool.cpp (a thin CLI over common/include/protocol.h) with g++ and
-checks it against the Python implementation in tools/test_link.py, in both directions.
+checks it against the Python codec in ros2_ws/src/hg_teensy_bridge/hg_teensy_bridge/protocol.py
+(used by the teensy_bridge node and tools/test_link.py), in both directions.
 
 Run from anywhere:
     python3 common/test/test_protocol.py
@@ -25,7 +26,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 INCLUDE_DIR = REPO_ROOT / "common" / "include"
 TOOL_SOURCE = Path(__file__).resolve().parent / "protocol_tool.cpp"
-TEST_LINK = REPO_ROOT / "tools" / "test_link.py"
+PY_CODEC = REPO_ROOT / "ros2_ws" / "src" / "hg_teensy_bridge" / "hg_teensy_bridge" / "protocol.py"
 
 CXX = os.environ.get("CXX", "g++")
 CXX_FLAGS = [
@@ -44,7 +45,7 @@ SANITIZER_FLAGS = ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
 
 
 def load_python_protocol():
-    spec = importlib.util.spec_from_file_location("test_link", TEST_LINK)
+    spec = importlib.util.spec_from_file_location("hg_protocol", PY_CODEC)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

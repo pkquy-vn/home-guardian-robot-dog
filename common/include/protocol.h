@@ -15,7 +15,8 @@
 //   crc     CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF, no reflection, no final XOR)
 //           computed over type, length and payload (not the start byte).
 //
-// Python mirror: tools/test_link.py. Keep both in sync; common/test/test_protocol.py checks that
+// Python mirror: ros2_ws/src/hg_teensy_bridge/hg_teensy_bridge/protocol.py (used by the ROS 2
+// bridge and tools/test_link.py). Keep both in sync; common/test/test_protocol.py checks that
 // they agree.
 
 #ifndef HG_COMMON_PROTOCOL_H_
