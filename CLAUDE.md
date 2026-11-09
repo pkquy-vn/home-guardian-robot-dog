@@ -52,7 +52,8 @@ CI runs on every push and pull request: `firmware.yml` (host protocol test, `pio
 - **Python:** 4-space indent, 100 columns. Tools use the standard library plus pyserial only.
 - **Protocol changes:** `protocol.h` is the source of truth. Any change must be mirrored in
   `hg_teensy_bridge/protocol.py` (the only Python implementation), covered in
-  `common/test/test_protocol.py`, and reflected in the message table in `README.md`. Multi-byte fields are little-endian; payloads are at most 64 bytes.
+  `common/test/test_protocol.py`, and reflected in the message table in `README.md`.
+  Multi-byte fields are little-endian; payloads are at most 64 bytes.
 - **Bridge heartbeat:** `teensy_bridge` sends HEARTBEAT from a timer on its executor, in the
   default callback group. Never move it to a separate thread or callback group: a stalled node
   must stop the heartbeat so the Teensy watchdog trips.
