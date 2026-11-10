@@ -12,6 +12,9 @@
 //   protocol_tool unpack-heartbeat <payload-hex> -> sequence, or "invalid"
 //   protocol_tool pack-status <mode> <gait> <faults>  -> payload hex
 //   protocol_tool unpack-status <payload-hex>    -> "<mode> <gait> <faults>", or "invalid"
+//   protocol_tool pack-mode <mode>               -> payload hex
+//   protocol_tool unpack-mode <payload-hex>      -> mode, or "invalid"
+//   protocol_tool valid-modes                    -> every value 0..255 accepted by is_valid_mode
 //
 // Numeric arguments accept decimal or 0x-prefixed hex.
 
@@ -144,6 +147,31 @@ int main(int argc, char** argv) {
       return 0;
     }
     std::printf("%u %u %u\n", status.mode, status.gait_phase, status.fault_bits);
+    return 0;
+  }
+
+  if (cmd == "pack-mode" && argc == 3) {
+    uint8_t payload[hg::kModePayloadSize];
+    hg::pack_mode(static_cast<uint8_t>(parse_number(argv[2])), payload);
+    std::printf("%s\n", to_hex(payload, sizeof(payload)).c_str());
+    return 0;
+  }
+
+  if (cmd == "unpack-mode" && argc == 3) {
+    if (!parse_hex(argv[2], &bytes)) return usage();
+    uint8_t mode = 0;
+    if (!hg::unpack_mode(bytes.data(), bytes.size(), &mode)) {
+      std::printf("invalid\n");
+      return 0;
+    }
+    std::printf("%u\n", mode);
+    return 0;
+  }
+
+  if (cmd == "valid-modes" && argc == 2) {
+    for (unsigned v = 0; v <= 0xFF; ++v) {
+      if (hg::is_valid_mode(static_cast<uint8_t>(v))) std::printf("%u\n", v);
+    }
     return 0;
   }
 

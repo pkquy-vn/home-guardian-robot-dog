@@ -176,6 +176,38 @@ class PayloadTest(unittest.TestCase):
         self.assertIsNone(py.unpack_status(b"\x03\x07\x01"))
         self.assertIsNone(py.unpack_heartbeat(b"\x00" * 5))
 
+    def test_mode_payload(self):
+        for mode in (0, 1, 2, 3, 9, 7, 255):
+            with self.subTest(mode=mode):
+                self.assertEqual(cpp("pack-mode", str(mode)), py.pack_mode(mode).hex())
+                self.assertEqual(cpp("unpack-mode", f"{mode:02x}"), str(mode))
+                self.assertEqual(py.unpack_mode(bytes([mode])), mode)
+        self.assertEqual(cpp("unpack-mode", ""), "invalid")
+        self.assertEqual(cpp("unpack-mode", "0200"), "invalid")
+        self.assertIsNone(py.unpack_mode(b""))
+        self.assertIsNone(py.unpack_mode(b"\x02\x00"))
+        with self.assertRaises(ValueError):
+            py.pack_mode(256)
+
+    def test_mode_values_agree(self):
+        cpp_modes = [int(v) for v in cpp("valid-modes").split()]
+        self.assertEqual(cpp_modes, sorted(py.MODE_NAMES))
+        self.assertEqual(
+            (py.MODE_LIE, py.MODE_SIT, py.MODE_STAND, py.MODE_WALK, py.MODE_TORQUE_OFF),
+            (0, 1, 2, 3, 9),
+        )
+
+    def test_mode_and_clear_fault_frames(self):
+        cases = [(py.MODE, py.pack_mode(m)) for m in sorted(py.MODE_NAMES)]
+        cases.append((py.CLEAR_FAULT, b""))
+        for msg_type, payload in cases:
+            with self.subTest(msg_type=msg_type, payload=payload.hex()):
+                frame = py.encode_frame(msg_type, payload)
+                self.assertEqual(cpp_encode(msg_type, payload), frame)
+                self.assertEqual(cpp_parse(frame)[0], [(msg_type, payload)])
+        crc = py.crc16_ccitt_false(bytes([0x08, 0x00]))
+        self.assertEqual(py.encode_frame(py.CLEAR_FAULT), bytes([0xA5, 0x08, 0x00, crc & 0xFF, crc >> 8]))
+
     def test_fault_bit_names(self):
         self.assertEqual(py.decode_fault_bits(0), "none")
         self.assertEqual(py.decode_fault_bits(0x0001), "HEARTBEAT_LOST")

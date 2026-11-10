@@ -37,8 +37,8 @@ constexpr size_t kMaxFrameSize = kHeaderSize + kMaxPayload + kCrcSize;
 constexpr uint16_t kCrcInit = 0xFFFF;
 constexpr uint16_t kCrcPoly = 0x1021;
 
-// Message type IDs. Only kHeartbeat and kStatus have defined payloads so far; the others are
-// reserved IDs whose payloads will be specified when they are implemented.
+// Message type IDs. kHeartbeat, kMode, kClearFault and kStatus have defined payloads; the others
+// are reserved IDs whose payloads will be specified when they are implemented.
 enum class MsgType : uint8_t {
   // Pi -> Teensy
   kHeartbeat = 0x01,   // HEARTBEAT
@@ -58,6 +58,22 @@ enum class MsgType : uint8_t {
   kStatus = 0x16,      // STATUS
   kFault = 0x17,       // FAULT
 };
+
+// Posture modes: requested with MODE, reported in StatusPayload::mode.
+enum class Mode : uint8_t {
+  kLie = 0,        // LIE
+  kSit = 1,        // SIT
+  kStand = 2,      // STAND
+  kWalk = 3,       // WALK
+  kTorqueOff = 9,  // TORQUE_OFF
+};
+
+inline bool is_valid_mode(uint8_t value) {
+  return value == static_cast<uint8_t>(Mode::kLie) || value == static_cast<uint8_t>(Mode::kSit) ||
+         value == static_cast<uint8_t>(Mode::kStand) ||
+         value == static_cast<uint8_t>(Mode::kWalk) ||
+         value == static_cast<uint8_t>(Mode::kTorqueOff);
+}
 
 // Fault bits reported in StatusPayload::fault_bits.
 constexpr uint16_t kFaultHeartbeatLost = 1u << 0;  // HEARTBEAT_LOST
@@ -259,6 +275,20 @@ inline bool unpack_heartbeat(const uint8_t* payload, size_t len, uint32_t* seque
   *sequence = get_u32le(payload);
   return true;
 }
+
+// MODE (Pi -> Teensy): uint8 requested mode (a Mode value; the firmware rejects others).
+constexpr size_t kModePayloadSize = 1;
+
+inline void pack_mode(uint8_t mode, uint8_t* out) { out[0] = mode; }
+
+inline bool unpack_mode(const uint8_t* payload, size_t len, uint8_t* mode) {
+  if (len != kModePayloadSize || payload == nullptr || mode == nullptr) return false;
+  *mode = payload[0];
+  return true;
+}
+
+// CLEAR_FAULT (Pi -> Teensy): empty payload.
+constexpr size_t kClearFaultPayloadSize = 0;
 
 // STATUS (Teensy -> Pi): uint8 mode, uint8 gait phase, uint16 fault bits.
 constexpr size_t kStatusPayloadSize = 4;

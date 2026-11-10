@@ -39,9 +39,25 @@ BATTERY = 0x15
 STATUS = 0x16
 FAULT = 0x17
 
+# Posture modes: requested with MODE, reported in STATUS.
+MODE_LIE = 0
+MODE_SIT = 1
+MODE_STAND = 2
+MODE_WALK = 3
+MODE_TORQUE_OFF = 9
+MODE_NAMES = {
+    MODE_LIE: "LIE",
+    MODE_SIT: "SIT",
+    MODE_STAND: "STAND",
+    MODE_WALK: "WALK",
+    MODE_TORQUE_OFF: "TORQUE_OFF",
+}
+
 FAULT_BIT_NAMES = {0: "HEARTBEAT_LOST"}
 
 HEARTBEAT_PAYLOAD_SIZE = 4
+MODE_PAYLOAD_SIZE = 1
+CLEAR_FAULT_PAYLOAD_SIZE = 0
 STATUS_PAYLOAD_SIZE = 4
 
 
@@ -135,6 +151,23 @@ def unpack_heartbeat(payload: bytes) -> Optional[int]:
     if len(payload) != HEARTBEAT_PAYLOAD_SIZE:
         return None
     return struct.unpack("<I", payload)[0]
+
+
+def pack_mode(mode: int) -> bytes:
+    """MODE payload: uint8 requested mode. Raises ValueError outside 0..255."""
+    if not 0 <= mode <= 0xFF:
+        raise ValueError(f"mode out of range: {mode}")
+    return struct.pack("<B", mode)
+
+
+def unpack_mode(payload: bytes) -> Optional[int]:
+    if len(payload) != MODE_PAYLOAD_SIZE:
+        return None
+    return payload[0]
+
+
+def mode_name(mode: int) -> str:
+    return MODE_NAMES.get(mode, f"UNKNOWN({mode})")
 
 
 def pack_status(mode: int, gait_phase: int, fault_bits: int) -> bytes:
