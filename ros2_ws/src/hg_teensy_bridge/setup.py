@@ -16,7 +16,7 @@ setup(
     zip_safe=True,
     maintainer="Wynn Pham",
     maintainer_email="215331687+pkquy-vn@users.noreply.github.com",
-    description="Home Guardian Pi-Teensy serial bridge: HEARTBEAT out, STATUS in.",
+    description="Home Guardian Pi-Teensy bridge: HEARTBEAT, MODE, CLEAR_FAULT out; STATUS in.",
     license="Apache-2.0",
     entry_points={
         "console_scripts": [

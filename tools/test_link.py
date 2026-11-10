@@ -32,6 +32,7 @@ from hg_teensy_bridge.protocol import (  # noqa: E402
     FrameParser,
     decode_fault_bits,
     encode_frame,
+    mode_name,
     pack_heartbeat,
     unpack_status,
 )
@@ -104,7 +105,7 @@ def run(port_name: str, baud: int) -> int:
                         mode_text, fault_text = "-", "- (no STATUS yet)"
                     else:
                         mode, _gait_phase, faults = last_status
-                        mode_text = str(mode)
+                        mode_text = f"{mode} ({mode_name(mode)})"
                         fault_text = f"0x{faults:04X} ({decode_fault_bits(faults)})"
                     print(
                         f"[{now - start:7.1f}s] hb_sent={heartbeats_sent} "

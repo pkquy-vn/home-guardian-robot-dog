@@ -3,6 +3,8 @@
 
 Implements what the firmware supports today:
   - sends HEARTBEAT at heartbeat_rate_hz with an incrementing uint32 sequence;
+  - sends MODE for each /teensy/cmd_mode message and CLEAR_FAULT for each /teensy/clear_fault
+    service call (the Teensy decides whether to accept them; there is no acknowledgement);
   - parses STATUS and publishes /teensy/mode, /teensy/faults, /teensy/connected and
     /diagnostics.
 
@@ -25,6 +27,7 @@ from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from std_msgs.msg import Bool, UInt8, UInt16
+from std_srvs.srv import Trigger
 
 import serial
 
@@ -55,6 +58,12 @@ class TeensyBridge(Node):
         self._faults_pub = self.create_publisher(UInt16, "/teensy/faults", 10)
         self._connected_pub = self.create_publisher(Bool, "/teensy/connected", 10)
         self._diag_pub = self.create_publisher(DiagnosticArray, "/diagnostics", 10)
+        self._cmd_mode_sub = self.create_subscription(
+            UInt8, "/teensy/cmd_mode", self._on_cmd_mode, 10
+        )
+        self._clear_fault_srv = self.create_service(
+            Trigger, "/teensy/clear_fault", self._on_clear_fault
+        )
 
         self._serial: Optional[serial.Serial] = None
         self._parser = protocol.FrameParser()
@@ -152,20 +161,54 @@ class TeensyBridge(Node):
         if self._stopping or self._serial is None:
             return
         frame = protocol.encode_frame(protocol.HEARTBEAT, protocol.pack_heartbeat(self._sequence))
-        try:
-            written = self._serial.write(frame)
-        except serial.SerialTimeoutException:
-            # OS transmit buffer full (the Teensy is not reading). Skip; never queue heartbeats.
-            self._heartbeats_dropped += 1
-            return
-        except (serial.SerialException, OSError) as exc:
-            self._port_lost(exc)
-            return
-        if written == len(frame):
+        if self._write_frame(frame):
             self._sequence = (self._sequence + 1) & 0xFFFFFFFF
             self._heartbeats_sent += 1
         else:
-            self._heartbeats_dropped += 1
+            self._heartbeats_dropped += 1  # Skipped, never queued.
+
+    def _write_frame(self, frame: bytes) -> bool:
+        """Writes one frame; returns True only if it was written completely."""
+        if self._stopping or self._serial is None:
+            return False
+        try:
+            written = self._serial.write(frame)
+        except serial.SerialTimeoutException:
+            return False  # OS transmit buffer full (the Teensy is not reading).
+        except (serial.SerialException, OSError) as exc:
+            self._port_lost(exc)
+            return False
+        return written == len(frame)
+
+    # ------------------------------------------------------------------------------------------
+    # Commands
+    # ------------------------------------------------------------------------------------------
+
+    def _on_cmd_mode(self, msg: UInt8) -> None:
+        mode = msg.data
+        name = protocol.mode_name(mode)
+        if mode not in protocol.MODE_NAMES:
+            self.get_logger().warning(f"cmd_mode {name}: unknown mode; the Teensy will reject it")
+        if self._write_frame(protocol.encode_frame(protocol.MODE, protocol.pack_mode(mode))):
+            self.get_logger().info(f"sent MODE {name}")
+        else:
+            self.get_logger().warning(f"MODE {name} not sent: serial port unavailable")
+
+    def _on_clear_fault(
+        self, request: Trigger.Request, response: Trigger.Response
+    ) -> Trigger.Response:
+        del request  # Trigger requests are empty.
+        if self._write_frame(protocol.encode_frame(protocol.CLEAR_FAULT)):
+            response.success = True
+            response.message = (
+                "CLEAR_FAULT sent; the Teensy clears the latch only while heartbeats are healthy. "
+                "Check /teensy/faults."
+            )
+        else:
+            response.success = False
+            response.message = "CLEAR_FAULT not sent: serial port unavailable"
+        self.get_logger().info(response.message)
+        return response
 
     # ------------------------------------------------------------------------------------------
     # STATUS
@@ -252,6 +295,9 @@ class TeensyBridge(Node):
             KeyValue(key="link_state", value=link_state),
             KeyValue(key="status_rate_hz", value=f"{status_rate:.1f}"),
             KeyValue(key="mode", value="-" if self._mode is None else str(self._mode)),
+            KeyValue(
+                key="mode_name", value="-" if self._mode is None else protocol.mode_name(self._mode)
+            ),
             KeyValue(key="fault_bits", value="-" if faults is None else f"0x{faults:04X}"),
             KeyValue(
                 key="faults", value="-" if faults is None else protocol.decode_fault_bits(faults)
