@@ -16,7 +16,7 @@ tool and a host-side protocol test. The other ROS 2 packages are planned but not
 | --- | --- | --- |
 | Role | High-level computer | Real-time controller |
 | Software | Ubuntu Server 24.04, ROS 2 Jazzy | Bare-metal Arduino-framework firmware, built with PlatformIO |
-| Today | `hg_teensy_bridge` (heartbeat, mode commands, status), `tools/test_link.py` | Posture mode state machine (timed, no servos yet), latching heartbeat watchdog, 10 Hz status, status LED |
+| Today | `hg_teensy_bridge` (heartbeat, mode commands, status, joint states), `hg_description` robot model, `tools/test_link.py` | Posture modes with leg kinematics and interpolated joint angles (no servos yet), latching heartbeat watchdog, 10 Hz status, 50 Hz joint state, status LED |
 | Planned | Localization, navigation, docking, perception, events, audio, behavior (ROS 2) | Joint control and gaits; joint state, IMU, odometry, foot contact and battery data |
 
 ### Serial link
@@ -53,7 +53,7 @@ next start byte.
 | IR_LED | `0x06` | Pi → Teensy | not defined yet | Reserved |
 | CONFIG | `0x07` | Pi → Teensy | not defined yet | Reserved |
 | CLEAR_FAULT | `0x08` | Pi → Teensy | empty | Implemented |
-| JOINT_STATE | `0x11` | Teensy → Pi | not defined yet | Reserved |
+| JOINT_STATE | `0x11` | Teensy → Pi | 8 x (`int16` position in 0.01 deg, `int16` current, `int8` temperature), FL hip, FL knee, FR hip, FR knee, RL hip, RL knee, RR hip, RR knee | Implemented (commanded angles; current and temperature 0 until servos exist) |
 | IMU | `0x12` | Teensy → Pi | not defined yet | Reserved |
 | ODOM | `0x13` | Teensy → Pi | not defined yet | Reserved |
 | CONTACT | `0x14` | Teensy → Pi | not defined yet | Reserved |
@@ -62,9 +62,12 @@ next start byte.
 | FAULT | `0x17` | Teensy → Pi | not defined yet | Reserved |
 
 Modes: 0 `LIE`, 1 `SIT`, 2 `STAND`, 3 `WALK`, 9 `TORQUE_OFF`. The firmware boots in LIE and
-runs the posture state machine in [`firmware/src/posture.h`](firmware/src/posture.h). There are
-no servos yet, so timed transitions stand in for joint motion: LIE to STAND takes 1.6 s, every
-other transition 1.0 s, and TORQUE_OFF is immediate. STATUS reports the old mode until a
+runs the posture state machine in [`firmware/src/posture.h`](firmware/src/posture.h). Each mode
+has a joint-level reference pose computed with the leg kinematics; during a transition all eight
+joint angles move to the target pose with a smooth (minimum-jerk) profile. LIE to STAND takes
+1.6 s, every other transition 1.0 s, and TORQUE_OFF is immediate and holds the last angles.
+There are no servos yet: the commanded angles are only reported in JOINT_STATE. Geometry, joint
+conventions and poses: [docs/kinematics.md](docs/kinematics.md). STATUS reports the old mode until a
 transition completes. LIE, SIT and STAND can be requested from each other, WALK only from
 STAND, from WALK only STAND, and from TORQUE_OFF only LIE. TORQUE_OFF is accepted from anywhere,
 at any time. Other requests are rejected (and counted on the Teensy) when they are illegal,
@@ -91,7 +94,7 @@ the link is OK and no fault is set, and at 5 Hz otherwise.
 │   ├── decisions/       Architecture decision records
 │   └── setup/           How the Raspberry Pi was set up
 ├── firmware/            PlatformIO project for the Teensy 4.1
-├── ros2_ws/src/         colcon workspace: hg_teensy_bridge (other packages planned)
+├── ros2_ws/src/         colcon workspace: hg_teensy_bridge, hg_description, hg_bringup
 └── tools/               Pi-side utilities (test_link.py)
 ```
 
@@ -153,10 +156,13 @@ Because the fault now latches, it stays set (`0x0001`) on the next run until CLE
 through the ROS bridge or the Teensy is reset.
 Only one program can use the serial port at a time, so close any serial monitor first.
 
-## ROS 2: hg_teensy_bridge
+## ROS 2: hg_teensy_bridge, hg_description, hg_bringup
 
 The `teensy_bridge` node owns the serial link on the Pi: it sends HEARTBEAT and publishes what
-the Teensy reports in STATUS. Only one program can use the port, so do not run
+the Teensy reports in STATUS and JOINT_STATE. `hg_description` holds the robot model (xacro
+URDF; its joint values equal the firmware's hip and knee angles in radians, see
+[docs/kinematics.md](docs/kinematics.md)), and `hg_bringup` starts the bridge together with
+`robot_state_publisher`. Only one program can use the port, so do not run
 `tools/test_link.py` at the same time.
 
 The heartbeat is sent from a timer on the node's executor, never from a separate thread: if the
@@ -181,8 +187,10 @@ source install/setup.bash
 ```
 
 ```bash
-ros2 launch hg_teensy_bridge bridge.launch.py
+ros2 launch hg_bringup robot.launch.py
 ```
+
+(`ros2 launch hg_teensy_bridge bridge.launch.py` starts the bridge alone.)
 
 Parameters (launch arguments of the same name): `port` (default `/dev/ttyACM0`), `baud`
 (`115200`, ignored by USB serial), `heartbeat_rate_hz` (`20.0`), `status_timeout_s` (`0.5`).
@@ -194,6 +202,7 @@ With `ros2 run`, give the float parameters a decimal point, for example
 | `/teensy/mode` | `std_msgs/UInt8` | STATUS mode, on every STATUS (about 10 Hz) |
 | `/teensy/faults` | `std_msgs/UInt16` | STATUS fault bits (bit 0 `HEARTBEAT_LOST`), on every STATUS |
 | `/teensy/connected` | `std_msgs/Bool` | True while STATUS arrived within `status_timeout_s`; 2 Hz and on change |
+| `/joint_states` | `sensor_msgs/JointState` | Joint angles in radians from JOINT_STATE (50 Hz), names `fl_hip_joint` ... `rr_knee_joint` |
 | `/diagnostics` | `diagnostic_msgs/DiagnosticArray` | 1 Hz: link state, STATUS rate, mode and mode name, decoded faults, CRC errors, heartbeats sent |
 | `/teensy/cmd_mode` (subscribed) | `std_msgs/UInt8` | Requested mode; each message is sent as MODE |
 | `/teensy/clear_fault` (service) | `std_srvs/Trigger` | Sends CLEAR_FAULT. Success means sent, not accepted: check `/teensy/faults` |
@@ -213,27 +222,29 @@ ros2 service call /teensy/clear_fault std_srvs/srv/Trigger
 **Works today**
 
 - Protocol (`common/include/protocol.h`): frame encoding, CRC, a resynchronizing parser and the
-  HEARTBEAT, MODE, CLEAR_FAULT and STATUS payloads. The host test checks the C++ and Python
-  implementations against each other and runs in CI.
-- Firmware: posture mode state machine with timed transitions and a latching heartbeat watchdog
-  (host-tested in `firmware/test_host`), STATUS at 10 Hz, status LED. Built by CI on every push
+  HEARTBEAT, MODE, CLEAR_FAULT, STATUS and JOINT_STATE payloads. The host test checks the C++
+  and Python implementations against each other and runs in CI.
+- Firmware: posture mode state machine with a latching heartbeat watchdog, leg kinematics with
+  joint-level reference poses (both host-tested in `firmware/test_host`), interpolated joint
+  angles, STATUS at 10 Hz, JOINT_STATE at 50 Hz, status LED. Built by CI on every push
   and pull request.
 - `tools/test_link.py`: heartbeat sender and STATUS monitor.
-- `hg_teensy_bridge`: ROS 2 node for HEARTBEAT, MODE, CLEAR_FAULT and STATUS. Built with colcon
-  in CI.
+- `hg_teensy_bridge`: ROS 2 node for HEARTBEAT, MODE, CLEAR_FAULT, STATUS and `/joint_states`.
+  `hg_description` (robot model) and `hg_bringup` (launch). Built with colcon in CI.
 
 **Not yet verified on hardware**
 
-- The firmware, the link test and `hg_teensy_bridge` have not yet been run against a Teensy.
+- The joint-level postures, `/joint_states` and the robot model have not yet been run on the
+  robot or viewed in RViz.
 
 **Next**
 
 - Run the firmware and link test on the robot.
-- Replace the timed transitions with joint interpolation once servos are fitted.
+- Drive the servos with the commanded angles once they are fitted (calibrate direction signs
+  and offsets).
 - Define payloads for the remaining reserved message types.
-- ROS 2 packages: `hg_msgs`, `hg_description`, `hg_bringup`,
-  `hg_localization`, `hg_navigation`, `hg_docking`, `hg_perception`, `hg_events`, `hg_audio`,
-  `hg_behavior`, `hg_sim`.
+- ROS 2 packages: `hg_msgs`, `hg_localization`, `hg_navigation`, `hg_docking`, `hg_perception`,
+  `hg_events`, `hg_audio`, `hg_behavior`, `hg_sim`.
 - Move the link to the hardware UART once a taller stacking header is fitted (ADR 0001).
 - Add the CAD files with upstream attribution and license ([cad/README.md](cad/README.md)).
 

@@ -7,8 +7,8 @@ Guidance for Claude Code (and anyone else) working in this repository.
 Home Guardian is a custom 8-DOF quadruped robot for autonomous indoor patrol.
 
 - **Raspberry Pi 5 (8 GB):** Ubuntu Server 24.04, ROS 2 Jazzy. High-level software.
-  `ros2_ws/src/hg_teensy_bridge` (ament_python) owns the serial link; the other `hg_*` packages
-  are planned but not written yet.
+  `ros2_ws/src`: `hg_teensy_bridge` (ament_python, owns the serial link), `hg_description`
+  (xacro URDF), `hg_bringup` (launch). The other `hg_*` packages are planned but not written yet.
 - **Teensy 4.1:** bare-metal Arduino-framework firmware built with PlatformIO
   (`firmware/`). Real-time controller. Connected to the Pi over USB as `/dev/ttyACM0`.
 - **Link:** framed binary serial protocol, `0xA5 | type | length | payload | CRC-16/CCITT-FALSE`
@@ -16,11 +16,14 @@ Home Guardian is a custom 8-DOF quadruped robot for autonomous indoor patrol.
   `ros2_ws/src/hg_teensy_bridge/hg_teensy_bridge/protocol.py`, used by the bridge node and
   `tools/test_link.py`. USB serial for now; hardware UART deferred
   (`docs/decisions/0001-usb-serial-link.md`).
-- Implemented message types: HEARTBEAT, MODE, CLEAR_FAULT (Pi → Teensy) and STATUS (Teensy → Pi).
-  All other IDs are reserved without a payload definition.
+- Implemented message types: HEARTBEAT, MODE, CLEAR_FAULT (Pi → Teensy), STATUS and JOINT_STATE
+  (Teensy → Pi). All other IDs are reserved without a payload definition.
 - Firmware safety logic: posture mode state machine and latching heartbeat watchdog in
   `firmware/src/posture.h` (plain C++, host-tested). See
   `docs/decisions/0002-heartbeat-loss-latches.md`.
+- Kinematics (high risk, host-tested): leg IK/FK and reference poses in
+  `firmware/src/kinematics.h`; conventions, poses and the URDF mapping in `docs/kinematics.md`.
+  Keep `hg_description` consistent with it.
 - **The repository is public.**
 
 ## Build and test
@@ -29,7 +32,7 @@ Run from the repository root.
 
 ```bash
 python3 common/test/test_protocol.py        # host protocol test: g++ vs Python, no hardware
-firmware/test_host/run_tests.sh             # host tests: posture state machine (safety logic)
+firmware/test_host/run_tests.sh             # host tests: posture state machine, kinematics
 pio run -d firmware                         # build the firmware
 clang-format --dry-run --Werror common/include/*.h common/test/*.cpp firmware/src/*.cpp
 ```
