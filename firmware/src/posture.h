@@ -71,6 +71,11 @@ class PostureStateMachine {
   Mode reported_mode() const { return current_; }
   bool in_transition() const { return in_transition_; }
   Mode transition_target() const { return target_; }
+  // Timing of the current (or last) transition, and the number of transitions started so far
+  // (changes whenever a new transition starts, including an abort into another one).
+  uint32_t transition_start_ms() const { return transition_start_ms_; }
+  uint32_t transition_length_ms() const { return transition_duration_ms_; }
+  uint32_t transition_count() const { return transition_count_; }
   uint16_t fault_bits() const;
   bool fault_latched() const { return latched_; }
   bool torque_off_pending() const { return torque_off_pending_; }
@@ -105,6 +110,7 @@ class PostureStateMachine {
 
   uint32_t rejected_requests_ = 0;
   uint32_t rejected_clears_ = 0;
+  uint32_t transition_count_ = 0;
 };
 
 }  // namespace hg

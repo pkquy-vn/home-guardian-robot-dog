@@ -145,6 +145,7 @@ void PostureStateMachine::start_transition(Mode to, uint32_t now_ms) {
   target_ = to;
   transition_start_ms_ = now_ms;
   in_transition_ = true;
+  ++transition_count_;
 }
 
 void PostureStateMachine::enter_torque_off() {

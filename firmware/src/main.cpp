@@ -6,9 +6,12 @@
 //   - HEARTBEAT in (uint32 sequence), MODE in (uint8 mode), CLEAR_FAULT in (empty).
 //   - Posture mode state machine with heartbeat watchdog and heartbeat-loss response
 //     (posture.h; HEARTBEAT_LOST latches, see docs/decisions/0002-heartbeat-loss-latches.md).
-//     No servos yet: timed transitions stand in for joint interpolation.
+//   - Joint-level postures (kinematics.h, joint_motion.h): during a transition all eight joint
+//     angles are interpolated to the target pose with a minimum-jerk profile. No servos yet: the
+//     commanded angles are only reported.
 //   - 200 Hz control tick: an IntervalTimer sets a flag, the work runs in loop().
 //   - STATUS out at 10 Hz (uint8 mode, uint8 gait phase, uint16 fault bits).
+//   - JOINT_STATE out at 50 Hz (commanded angles in 0.01 deg; current and temperature 0).
 //   - On-board LED: 1 Hz blink while the link is OK and no fault is set, 5 Hz otherwise.
 // All other message types are parsed and ignored.
 //
@@ -17,6 +20,7 @@
 
 #include <Arduino.h>
 
+#include "joint_motion.h"
 #include "posture.h"
 #include "protocol.h"
 
@@ -29,12 +33,15 @@ namespace {
 constexpr uint32_t kLinkBaud = 115200;            // Ignored by USB serial; used by hardware UARTs.
 constexpr uint32_t kControlPeriodUs = 5000;       // 200 Hz control tick.
 constexpr uint32_t kStatusPeriodMs = 100;         // 10 Hz
+constexpr uint32_t kJointStatePeriodMs = 20;      // 50 Hz
 constexpr uint32_t kLedTogglePeriodOkMs = 500;    // 1 Hz blink
 constexpr uint32_t kLedTogglePeriodLostMs = 100;  // 5 Hz blink
 constexpr int kMaxBytesPerLoop = 256;             // Bound the time spent reading per loop.
 
 hg::FrameParser parser;
 hg::PostureStateMachine posture;
+hg::JointMotion joint_motion;
+uint32_t last_joint_state_ms = 0;
 
 IntervalTimer control_timer;
 volatile bool control_tick_due = false;
@@ -97,7 +104,11 @@ void run_control_tick() {
     last_fallback_tick_ms = millis();
     due = true;
   }
-  if (due) posture.tick(millis());
+  if (due) {
+    const uint32_t now = millis();
+    posture.tick(now);
+    joint_motion.update(posture, now);
+  }
 }
 
 void send_status(uint32_t now) {
@@ -121,6 +132,35 @@ void send_status(uint32_t now) {
   LINK.write(frame, n);
 }
 
+int16_t to_centidegrees(float deg) {
+  const float cdeg = deg * 100.0f;
+  if (!(cdeg > -32768.0f)) return -32768;  // Also catches NaN.
+  if (cdeg >= 32767.0f) return 32767;
+  return static_cast<int16_t>(cdeg < 0.0f ? cdeg - 0.5f : cdeg + 0.5f);  // Round to nearest.
+}
+
+void send_joint_state(uint32_t now) {
+  if (now - last_joint_state_ms < kJointStatePeriodMs) return;
+  last_joint_state_ms = now;
+
+  hg::JointStateEntry joints[hg::kNumJoints];
+  const hg::RobotPose& pose = joint_motion.commanded();
+  for (int leg = 0; leg < hg::kNumLegs; ++leg) {
+    // Until servos exist: commanded angle, current 0, temperature 0.
+    joints[2 * leg].position_cdeg = to_centidegrees(pose.legs[leg].hip_deg);
+    joints[2 * leg + 1].position_cdeg = to_centidegrees(pose.legs[leg].knee_deg);
+  }
+  uint8_t payload[hg::kJointStatePayloadSize];
+  hg::pack_joint_state(joints, payload);
+
+  uint8_t frame[hg::kMaxFrameSize];
+  const size_t n =
+      hg::encode_frame(hg::MsgType::kJointState, payload, sizeof(payload), frame, sizeof(frame));
+  if (n == 0) return;
+  if (LINK.availableForWrite() < static_cast<int>(n)) return;  // Skip rather than block.
+  LINK.write(frame, n);
+}
+
 void update_led(uint32_t now) {
   const uint32_t period = posture.fault_bits() != 0 ? kLedTogglePeriodLostMs : kLedTogglePeriodOkMs;
   if (now - last_led_toggle_ms < period) return;
@@ -134,7 +174,8 @@ void update_led(uint32_t now) {
 void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWriteFast(LED_BUILTIN, LOW);
-  LINK.begin(kLinkBaud);  // Does not wait for the host to open the port.
+  LINK.begin(kLinkBaud);                       // Does not wait for the host to open the port.
+  joint_motion.init(posture.reported_mode());  // Boot pose: LIE.
   control_timer_running = control_timer.begin(on_control_timer, kControlPeriodUs);
 }
 
@@ -143,5 +184,6 @@ void loop() {
   run_control_tick();
   const uint32_t now = millis();
   send_status(now);
+  send_joint_state(now);
   update_led(now);
 }
