@@ -16,8 +16,11 @@ Home Guardian is a custom 8-DOF quadruped robot for autonomous indoor patrol.
   `ros2_ws/src/hg_teensy_bridge/hg_teensy_bridge/protocol.py`, used by the bridge node and
   `tools/test_link.py`. USB serial for now; hardware UART deferred
   (`docs/decisions/0001-usb-serial-link.md`).
-- Implemented message types: HEARTBEAT (Pi → Teensy) and STATUS (Teensy → Pi). All other IDs are
-  reserved without a payload definition.
+- Implemented message types: HEARTBEAT, MODE, CLEAR_FAULT (Pi → Teensy) and STATUS (Teensy → Pi).
+  All other IDs are reserved without a payload definition.
+- Firmware safety logic: posture mode state machine and latching heartbeat watchdog in
+  `firmware/src/posture.h` (plain C++, host-tested). See
+  `docs/decisions/0002-heartbeat-loss-latches.md`.
 - **The repository is public.**
 
 ## Build and test
@@ -26,6 +29,7 @@ Run from the repository root.
 
 ```bash
 python3 common/test/test_protocol.py        # host protocol test: g++ vs Python, no hardware
+firmware/test_host/run_tests.sh             # host tests: posture state machine (safety logic)
 pio run -d firmware                         # build the firmware
 clang-format --dry-run --Werror common/include/*.h common/test/*.cpp firmware/src/*.cpp
 ```
@@ -39,7 +43,7 @@ python3 tools/test_link.py /dev/ttyACM0     # live link test against the Teensy
 
 ROS 2: `source /opt/ros/jazzy/setup.bash`, then `colcon build --symlink-install` in `ros2_ws/`.
 
-CI runs on every push and pull request: `firmware.yml` (host protocol test, `pio run`) and
+CI runs on every push and pull request: `firmware.yml` (host tests, `pio run`) and
 `ros2.yml` (`colcon build` in the `ros:jazzy-ros-base` container).
 
 ## Conventions

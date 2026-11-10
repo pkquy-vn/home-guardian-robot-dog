@@ -16,7 +16,7 @@ tool and a host-side protocol test. The other ROS 2 packages are planned but not
 | --- | --- | --- |
 | Role | High-level computer | Real-time controller |
 | Software | Ubuntu Server 24.04, ROS 2 Jazzy | Bare-metal Arduino-framework firmware, built with PlatformIO |
-| Today | `hg_teensy_bridge` (heartbeat and status), `tools/test_link.py` | Heartbeat watchdog, 10 Hz status, status LED |
+| Today | `hg_teensy_bridge` (heartbeat, mode commands, status), `tools/test_link.py` | Posture mode state machine (timed, no servos yet), latching heartbeat watchdog, 10 Hz status, status LED |
 | Planned | Localization, navigation, docking, perception, events, audio, behavior (ROS 2) | Joint control and gaits; joint state, IMU, odometry, foot contact and battery data |
 
 ### Serial link
@@ -48,22 +48,35 @@ next start byte.
 | HEARTBEAT | `0x01` | Pi → Teensy | `uint32` sequence | Implemented |
 | CMD_VEL | `0x02` | Pi → Teensy | not defined yet | Reserved |
 | BODY_POSE | `0x03` | Pi → Teensy | not defined yet | Reserved |
-| MODE | `0x04` | Pi → Teensy | not defined yet | Reserved |
+| MODE | `0x04` | Pi → Teensy | `uint8` requested mode | Implemented |
 | LED | `0x05` | Pi → Teensy | not defined yet | Reserved |
 | IR_LED | `0x06` | Pi → Teensy | not defined yet | Reserved |
 | CONFIG | `0x07` | Pi → Teensy | not defined yet | Reserved |
-| CLEAR_FAULT | `0x08` | Pi → Teensy | not defined yet | Reserved |
+| CLEAR_FAULT | `0x08` | Pi → Teensy | empty | Implemented |
 | JOINT_STATE | `0x11` | Teensy → Pi | not defined yet | Reserved |
 | IMU | `0x12` | Teensy → Pi | not defined yet | Reserved |
 | ODOM | `0x13` | Teensy → Pi | not defined yet | Reserved |
 | CONTACT | `0x14` | Teensy → Pi | not defined yet | Reserved |
 | BATTERY | `0x15` | Teensy → Pi | not defined yet | Reserved |
-| STATUS | `0x16` | Teensy → Pi | `uint8` mode, `uint8` gait phase, `uint16` fault bits | Implemented (mode and gait phase are always 0 for now) |
+| STATUS | `0x16` | Teensy → Pi | `uint8` mode, `uint8` gait phase, `uint16` fault bits | Implemented (gait phase is always 0 for now) |
 | FAULT | `0x17` | Teensy → Pi | not defined yet | Reserved |
 
-Fault bits: bit 0 `HEARTBEAT_LOST`. The firmware sets it at boot and whenever no valid
-HEARTBEAT has arrived for 500 ms, and clears it when heartbeats resume. The on-board LED blinks
-at 1 Hz while the link is OK and at 5 Hz while the heartbeat is lost.
+Modes: 0 `LIE`, 1 `SIT`, 2 `STAND`, 3 `WALK`, 9 `TORQUE_OFF`. The firmware boots in LIE and
+runs the posture state machine in [`firmware/src/posture.h`](firmware/src/posture.h). There are
+no servos yet, so timed transitions stand in for joint motion: LIE to STAND takes 1.6 s, every
+other transition 1.0 s, and TORQUE_OFF is immediate. STATUS reports the old mode until a
+transition completes. LIE, SIT and STAND can be requested from each other, WALK only from
+STAND, from WALK only STAND, and from TORQUE_OFF only LIE. TORQUE_OFF is accepted from anywhere,
+at any time. Other requests are rejected (and counted on the Teensy) when they are illegal,
+arrive during a transition or arrive while a fault bit is set.
+
+Fault bits: bit 0 `HEARTBEAT_LOST`. It is set at boot and clears on the first heartbeat. After
+that, 500 ms without a heartbeat latches it: it stays set after heartbeats resume, until a
+CLEAR_FAULT arrives while heartbeats are healthy (or the Teensy is reset). On a loss the robot
+moves to SIT and turns torque off 5 s later; from LIE it stays in LIE. During a transition the
+target decides. Only an accepted CLEAR_FAULT cancels the pending torque-off. See
+[ADR 0002](docs/decisions/0002-heartbeat-loss-latches.md). The on-board LED blinks at 1 Hz while
+the link is OK and no fault is set, and at 5 Hz otherwise.
 
 ## Repository layout
 
@@ -136,6 +149,8 @@ What to expect, once the firmware is running: the script prints one line per sec
 number of heartbeats sent, about 10 STATUS frames per second, the mode, the decoded fault bits
 and the CRC error count. Fault bits should read `0x0000 (none)` and the Teensy LED should blink
 at 1 Hz. After you stop the script, the LED should switch to 5 Hz within about half a second.
+Because the fault now latches, it stays set (`0x0001`) on the next run until CLEAR_FAULT is sent
+through the ROS bridge or the Teensy is reset.
 Only one program can use the serial port at a time, so close any serial monitor first.
 
 ## ROS 2: hg_teensy_bridge
@@ -179,19 +194,33 @@ With `ros2 run`, give the float parameters a decimal point, for example
 | `/teensy/mode` | `std_msgs/UInt8` | STATUS mode, on every STATUS (about 10 Hz) |
 | `/teensy/faults` | `std_msgs/UInt16` | STATUS fault bits (bit 0 `HEARTBEAT_LOST`), on every STATUS |
 | `/teensy/connected` | `std_msgs/Bool` | True while STATUS arrived within `status_timeout_s`; 2 Hz and on change |
-| `/diagnostics` | `diagnostic_msgs/DiagnosticArray` | 1 Hz: link state, STATUS rate, mode, decoded faults, CRC errors, heartbeats sent |
+| `/diagnostics` | `diagnostic_msgs/DiagnosticArray` | 1 Hz: link state, STATUS rate, mode and mode name, decoded faults, CRC errors, heartbeats sent |
+| `/teensy/cmd_mode` (subscribed) | `std_msgs/UInt8` | Requested mode; each message is sent as MODE |
+| `/teensy/clear_fault` (service) | `std_srvs/Trigger` | Sends CLEAR_FAULT. Success means sent, not accepted: check `/teensy/faults` |
+
+Request STAND, then clear a latched fault:
+
+```bash
+ros2 topic pub --once /teensy/cmd_mode std_msgs/msg/UInt8 "{data: 2}"
+```
+
+```bash
+ros2 service call /teensy/clear_fault std_srvs/srv/Trigger
+```
 
 ## Project status
 
 **Works today**
 
 - Protocol (`common/include/protocol.h`): frame encoding, CRC, a resynchronizing parser and the
-  HEARTBEAT and STATUS payloads. The host test checks the C++ and Python implementations against
-  each other and runs in CI.
-- Firmware: HEARTBEAT watchdog (500 ms), STATUS at 10 Hz, status LED. Built by CI on every push
+  HEARTBEAT, MODE, CLEAR_FAULT and STATUS payloads. The host test checks the C++ and Python
+  implementations against each other and runs in CI.
+- Firmware: posture mode state machine with timed transitions and a latching heartbeat watchdog
+  (host-tested in `firmware/test_host`), STATUS at 10 Hz, status LED. Built by CI on every push
   and pull request.
 - `tools/test_link.py`: heartbeat sender and STATUS monitor.
-- `hg_teensy_bridge`: ROS 2 node for HEARTBEAT and STATUS. Built with colcon in CI.
+- `hg_teensy_bridge`: ROS 2 node for HEARTBEAT, MODE, CLEAR_FAULT and STATUS. Built with colcon
+  in CI.
 
 **Not yet verified on hardware**
 
@@ -200,7 +229,8 @@ With `ros2 run`, give the float parameters a decimal point, for example
 **Next**
 
 - Run the firmware and link test on the robot.
-- Define payloads for the reserved message types.
+- Replace the timed transitions with joint interpolation once servos are fitted.
+- Define payloads for the remaining reserved message types.
 - ROS 2 packages: `hg_msgs`, `hg_description`, `hg_bringup`,
   `hg_localization`, `hg_navigation`, `hg_docking`, `hg_perception`, `hg_events`, `hg_audio`,
   `hg_behavior`, `hg_sim`.
