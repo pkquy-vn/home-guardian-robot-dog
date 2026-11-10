@@ -17,6 +17,8 @@ jobs:
           python-version: "3.12"
       - name: Protocol host test (g++ vs Python)
         run: python3 common/test/test_protocol.py
+      - name: Firmware host tests (posture state machine)
+        run: firmware/test_host/run_tests.sh
       - uses: actions/cache@v6
         with:
           path: ~/.platformio
