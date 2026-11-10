@@ -208,6 +208,31 @@ class PayloadTest(unittest.TestCase):
         crc = py.crc16_ccitt_false(bytes([0x08, 0x00]))
         self.assertEqual(py.encode_frame(py.CLEAR_FAULT), bytes([0xA5, 0x08, 0x00, crc & 0xFF, crc >> 8]))
 
+    def test_joint_state_payload(self):
+        joints = [
+            (4123, 0, 0),
+            (10557, 0, 0),
+            (-4500, -1, -1),
+            (15000, 32767, 127),
+            (-32768, -32768, -128),
+            (32767, 1234, 45),
+            (0, -2, 3),
+            (-1, 0, 0),
+        ]
+        payload = py.pack_joint_state(joints)
+        self.assertEqual(len(payload), py.JOINT_STATE_PAYLOAD_SIZE)
+        self.assertEqual(len(payload), 40)
+        args = [str(v) for joint in joints for v in joint]
+        self.assertEqual(cpp("pack-joint-state", *args), payload.hex())
+        self.assertEqual(cpp("unpack-joint-state", payload.hex()).split(), args)
+        self.assertEqual(py.unpack_joint_state(payload), joints)
+        frame = py.encode_frame(py.JOINT_STATE, payload)
+        self.assertEqual(cpp_encode(py.JOINT_STATE, payload), frame)
+        self.assertEqual(cpp("unpack-joint-state", payload[:-1].hex()), "invalid")
+        self.assertIsNone(py.unpack_joint_state(payload + b"\x00"))
+        with self.assertRaises(ValueError):
+            py.pack_joint_state(joints[:7])
+
     def test_fault_bit_names(self):
         self.assertEqual(py.decode_fault_bits(0), "none")
         self.assertEqual(py.decode_fault_bits(0x0001), "HEARTBEAT_LOST")

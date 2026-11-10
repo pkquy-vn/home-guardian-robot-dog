@@ -15,6 +15,8 @@
 //   protocol_tool pack-mode <mode>               -> payload hex
 //   protocol_tool unpack-mode <payload-hex>      -> mode, or "invalid"
 //   protocol_tool valid-modes                    -> every value 0..255 accepted by is_valid_mode
+//   protocol_tool pack-joint-state <24 numbers>  -> payload hex (position, current, temp) x 8
+//   protocol_tool unpack-joint-state <hex>       -> 24 numbers, or "invalid"
 //
 // Numeric arguments accept decimal or 0x-prefixed hex.
 
@@ -165,6 +167,33 @@ int main(int argc, char** argv) {
       return 0;
     }
     std::printf("%u\n", mode);
+    return 0;
+  }
+
+  if (cmd == "pack-joint-state" && argc == 2 + 3 * static_cast<int>(hg::kNumJoints)) {
+    hg::JointStateEntry joints[hg::kNumJoints];
+    for (size_t i = 0; i < hg::kNumJoints; ++i) {
+      joints[i].position_cdeg = static_cast<int16_t>(std::strtol(argv[2 + 3 * i], nullptr, 0));
+      joints[i].current = static_cast<int16_t>(std::strtol(argv[3 + 3 * i], nullptr, 0));
+      joints[i].temperature = static_cast<int8_t>(std::strtol(argv[4 + 3 * i], nullptr, 0));
+    }
+    uint8_t payload[hg::kJointStatePayloadSize];
+    hg::pack_joint_state(joints, payload);
+    std::printf("%s\n", to_hex(payload, sizeof(payload)).c_str());
+    return 0;
+  }
+
+  if (cmd == "unpack-joint-state" && argc == 3) {
+    if (!parse_hex(argv[2], &bytes)) return usage();
+    hg::JointStateEntry joints[hg::kNumJoints];
+    if (!hg::unpack_joint_state(bytes.data(), bytes.size(), joints)) {
+      std::printf("invalid\n");
+      return 0;
+    }
+    for (const hg::JointStateEntry& j : joints) {
+      std::printf("%d %d %d ", j.position_cdeg, j.current, j.temperature);
+    }
+    std::printf("\n");
     return 0;
   }
 

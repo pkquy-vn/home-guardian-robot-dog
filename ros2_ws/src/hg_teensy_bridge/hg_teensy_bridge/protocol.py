@@ -10,7 +10,7 @@ Pure Python, standard library only (no ROS or pyserial imports).
 from __future__ import annotations
 
 import struct
-from typing import Optional
+from typing import Optional, Sequence
 
 START_BYTE = 0xA5
 MAX_PAYLOAD = 64
@@ -59,6 +59,21 @@ HEARTBEAT_PAYLOAD_SIZE = 4
 MODE_PAYLOAD_SIZE = 1
 CLEAR_FAULT_PAYLOAD_SIZE = 0
 STATUS_PAYLOAD_SIZE = 4
+
+# JOINT_STATE: 8 x (int16 position in 0.01 deg, int16 current, int8 temperature), in this order.
+JOINT_ORDER = (
+    "FL hip",
+    "FL knee",
+    "FR hip",
+    "FR knee",
+    "RL hip",
+    "RL knee",
+    "RR hip",
+    "RR knee",
+)
+NUM_JOINTS = len(JOINT_ORDER)
+JOINT_STATE_ENTRY_FORMAT = "<hhb"
+JOINT_STATE_PAYLOAD_SIZE = NUM_JOINTS * struct.calcsize(JOINT_STATE_ENTRY_FORMAT)  # 40
 
 
 def crc16_ccitt_false(data: bytes, crc: int = CRC_INIT) -> int:
@@ -179,6 +194,20 @@ def unpack_status(payload: bytes) -> Optional[tuple[int, int, int]]:
     if len(payload) != STATUS_PAYLOAD_SIZE:
         return None
     return struct.unpack("<BBH", payload)
+
+
+def pack_joint_state(joints: Sequence[tuple[int, int, int]]) -> bytes:
+    """JOINT_STATE payload from 8 (position_cdeg, current, temperature) tuples."""
+    if len(joints) != NUM_JOINTS:
+        raise ValueError(f"expected {NUM_JOINTS} joints, got {len(joints)}")
+    return b"".join(struct.pack(JOINT_STATE_ENTRY_FORMAT, *joint) for joint in joints)
+
+
+def unpack_joint_state(payload: bytes) -> Optional[list[tuple[int, int, int]]]:
+    """Returns 8 (position_cdeg, current, temperature) tuples, or None if the size is wrong."""
+    if len(payload) != JOINT_STATE_PAYLOAD_SIZE:
+        return None
+    return list(struct.iter_unpack(JOINT_STATE_ENTRY_FORMAT, payload))
 
 
 def decode_fault_bits(bits: int) -> str:

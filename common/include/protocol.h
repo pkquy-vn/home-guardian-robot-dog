@@ -37,8 +37,9 @@ constexpr size_t kMaxFrameSize = kHeaderSize + kMaxPayload + kCrcSize;
 constexpr uint16_t kCrcInit = 0xFFFF;
 constexpr uint16_t kCrcPoly = 0x1021;
 
-// Message type IDs. kHeartbeat, kMode, kClearFault and kStatus have defined payloads; the others
-// are reserved IDs whose payloads will be specified when they are implemented.
+// Message type IDs. kHeartbeat, kMode, kClearFault, kJointState and kStatus have defined
+// payloads; the others are reserved IDs whose payloads will be specified when they are
+// implemented.
 enum class MsgType : uint8_t {
   // Pi -> Teensy
   kHeartbeat = 0x01,   // HEARTBEAT
@@ -310,6 +311,50 @@ inline bool unpack_status(const uint8_t* payload, size_t len, StatusPayload* sta
   status->mode = payload[0];
   status->gait_phase = payload[1];
   status->fault_bits = get_u16le(payload + 2);
+  return true;
+}
+
+// JOINT_STATE (Teensy -> Pi): 8 x (int16 position in 0.01 deg, int16 current, int8
+// temperature), in JointIndex order. Until servos exist, position is the commanded angle and
+// current and temperature are 0.
+enum class JointIndex : uint8_t {
+  kFlHip = 0,
+  kFlKnee = 1,
+  kFrHip = 2,
+  kFrKnee = 3,
+  kRlHip = 4,
+  kRlKnee = 5,
+  kRrHip = 6,
+  kRrKnee = 7,
+};
+constexpr size_t kNumJoints = 8;
+constexpr size_t kJointStateEntrySize = 5;
+constexpr size_t kJointStatePayloadSize = kNumJoints * kJointStateEntrySize;  // 40
+
+struct JointStateEntry {
+  int16_t position_cdeg = 0;  // 0.01 deg
+  int16_t current = 0;        // Unit to be defined with the servos.
+  int8_t temperature = 0;     // Unit to be defined with the servos.
+};
+
+inline void pack_joint_state(const JointStateEntry (&joints)[kNumJoints], uint8_t* out) {
+  for (size_t i = 0; i < kNumJoints; ++i) {
+    uint8_t* entry = out + i * kJointStateEntrySize;
+    put_u16le(entry, static_cast<uint16_t>(joints[i].position_cdeg));
+    put_u16le(entry + 2, static_cast<uint16_t>(joints[i].current));
+    entry[4] = static_cast<uint8_t>(joints[i].temperature);
+  }
+}
+
+inline bool unpack_joint_state(const uint8_t* payload, size_t len,
+                               JointStateEntry (&joints)[kNumJoints]) {
+  if (len != kJointStatePayloadSize || payload == nullptr) return false;
+  for (size_t i = 0; i < kNumJoints; ++i) {
+    const uint8_t* entry = payload + i * kJointStateEntrySize;
+    joints[i].position_cdeg = static_cast<int16_t>(get_u16le(entry));
+    joints[i].current = static_cast<int16_t>(get_u16le(entry + 2));
+    joints[i].temperature = static_cast<int8_t>(entry[4]);
+  }
   return true;
 }
 
