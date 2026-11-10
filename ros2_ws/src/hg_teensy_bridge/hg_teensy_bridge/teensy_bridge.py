@@ -6,7 +6,9 @@ Implements what the firmware supports today:
   - sends MODE for each /teensy/cmd_mode message and CLEAR_FAULT for each /teensy/clear_fault
     service call (the Teensy decides whether to accept them; there is no acknowledgement);
   - parses STATUS and publishes /teensy/mode, /teensy/faults, /teensy/connected and
-    /diagnostics.
+    /diagnostics;
+  - parses JOINT_STATE and publishes /joint_states (sensor_msgs/JointState, radians), with the
+    joint names of the hg_description URDF.
 
 Safety: the heartbeat tells the Teensy that the Pi-side software is alive; the firmware raises
 HEARTBEAT_LOST after 500 ms without one. The heartbeat is therefore sent from a timer on this
@@ -18,6 +20,7 @@ cancelled before the port is closed.
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from typing import Optional
@@ -26,6 +29,7 @@ import rclpy
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, UInt8, UInt16
 from std_srvs.srv import Trigger
 
@@ -39,6 +43,12 @@ CONNECTED_PERIOD_S = 0.5  # /teensy/connected publish period (2 Hz), plus on cha
 DIAGNOSTICS_PERIOD_S = 1.0  # /diagnostics publish period.
 WRITE_TIMEOUT_S = 0.02  # Upper bound on a heartbeat write if the OS transmit buffer is full.
 MAX_READ_BYTES = 4096  # Upper bound on bytes read per poll.
+
+# URDF joint names (hg_description) in JOINT_STATE order: FL hip, FL knee, FR hip, ... RR knee.
+# The URDF joint values equal the firmware hip and knee angles (docs/kinematics.md).
+JOINT_NAMES = [
+    f"{leg}_{joint}_joint" for leg in ("fl", "fr", "rl", "rr") for joint in ("hip", "knee")
+]
 
 
 class TeensyBridge(Node):
@@ -58,6 +68,7 @@ class TeensyBridge(Node):
         self._faults_pub = self.create_publisher(UInt16, "/teensy/faults", 10)
         self._connected_pub = self.create_publisher(Bool, "/teensy/connected", 10)
         self._diag_pub = self.create_publisher(DiagnosticArray, "/diagnostics", 10)
+        self._joint_state_pub = self.create_publisher(JointState, "/joint_states", 10)
         self._cmd_mode_sub = self.create_subscription(
             UInt8, "/teensy/cmd_mode", self._on_cmd_mode, 10
         )
@@ -226,7 +237,21 @@ class TeensyBridge(Node):
             for msg_type, payload in self._parser.feed(data):
                 if msg_type == protocol.STATUS:
                     self._handle_status(payload)
+                elif msg_type == protocol.JOINT_STATE:
+                    self._handle_joint_state(payload)
         self._update_connected()
+
+    def _handle_joint_state(self, payload: bytes) -> None:
+        joints = protocol.unpack_joint_state(payload)
+        if joints is None:
+            return
+        msg = JointState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.name = JOINT_NAMES
+        # Position in 0.01 deg -> rad. Current and temperature (0 until servos exist) are not
+        # published: their units are not defined yet.
+        msg.position = [math.radians(position_cdeg / 100.0) for position_cdeg, _, _ in joints]
+        self._joint_state_pub.publish(msg)
 
     def _handle_status(self, payload: bytes) -> None:
         status = protocol.unpack_status(payload)
