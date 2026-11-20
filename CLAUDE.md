@@ -123,6 +123,9 @@ stop.
   minutes, skip it and tell me what to run instead.
 - Ask first only for high-risk changes and for anything destructive: rewriting
   history, force pushing, deleting files.
+- For high-risk or unusually complex requests, first remind me to switch the
+  session to the most capable model if it is not already running on it, and wait
+  for my go-ahead before starting.
 
 ### Reports
 Ten lines or fewer: what changed, what was verified (one line), what I need to
