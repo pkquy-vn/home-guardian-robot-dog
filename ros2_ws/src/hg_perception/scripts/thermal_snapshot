@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""Saves one /thermal/image message as a false-color PNG (320 x 240) in ~/thermal_snapshots/.
+
+Usage: ros2 run hg_perception thermal_snapshot [--topic T] [--timeout S] [--output-dir D]
+Prints the file path and the image's min and max temperature.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import pathlib
+import sys
+import time
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from rclpy.utilities import remove_ros_args
+from sensor_msgs.msg import Image
+
+from hg_perception.false_color import false_color_png, temperatures_from_image
+
+OUTPUT_WIDTH = 320
+OUTPUT_HEIGHT = 240
+
+
+def wait_for_image(topic: str, timeout_s: float, argv: list[str]) -> Image | None:
+    rclpy.init(args=argv)
+    node = Node("thermal_snapshot")
+    received: list[Image] = []
+    # Best effort subscription: matches reliable and best-effort publishers.
+    node.create_subscription(Image, topic, received.append, qos_profile_sensor_data)
+    deadline = time.monotonic() + timeout_s
+    try:
+        while not received and time.monotonic() < deadline:
+            rclpy.spin_once(node, timeout_sec=0.1)
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+    return received[0] if received else None
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv if argv is None else argv
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--topic", default="/thermal/image")
+    parser.add_argument("--timeout", type=float, default=5.0, help="seconds to wait (default 5)")
+    parser.add_argument("--output-dir", default="~/thermal_snapshots")
+    args = parser.parse_args(remove_ros_args(argv)[1:])
+
+    try:
+        msg = wait_for_image(args.topic, args.timeout, argv)
+    except KeyboardInterrupt:
+        return 130
+    if msg is None:
+        print(
+            f"No message on {args.topic} within {args.timeout:g} s. Is thermal_node running?",
+            file=sys.stderr,
+        )
+        return 1
+
+    values, width, height = temperatures_from_image(msg)
+    png, t_min, t_max = false_color_png(values, width, height, OUTPUT_WIDTH, OUTPUT_HEIGHT)
+
+    out_dir = pathlib.Path(args.output_dir).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    path = out_dir / f"thermal_{stamp}_min{t_min:.1f}C_max{t_max:.1f}C.png"
+    path.write_bytes(png)
+
+    print(path)
+    print(f"min {t_min:.1f} C")
+    print(f"max {t_max:.1f} C")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

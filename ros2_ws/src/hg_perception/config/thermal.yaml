@@ -1,0 +1,13 @@
+# MLX90640 thermal camera (thermal_node). Read once at start: relaunch after editing.
+thermal_node:
+  ros__parameters:
+    i2c_device: /dev/i2c-1
+    address: 51               # 0x33 (decimal here: the ROS YAML parser is not guaranteed to read hex)
+    refresh_rate_hz: 8.0      # Subpages per second: 0.5, 1, 2, 4, 8, 16 (32 and 64 need >400 kHz I2C)
+    emissivity: 0.95
+    # Orientation: like a normal camera, an object on the sensor's left (seen from behind the
+    # sensor) must appear on the left of the image, and the top of the scene at the top.
+    flip_horizontal: false    # true if left and right are swapped
+    flip_vertical: false      # true if the image is upside down
+    frame_id: thermal_link
+    log_stats: true           # Once per second: min, max, mean, center temperature and rate
