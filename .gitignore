@@ -111,6 +111,7 @@ maps/
 clips/
 recordings/
 snapshots/
+thermal_snapshots/
 rosbag2_*/
 *.bag
 *.mcap

@@ -46,7 +46,7 @@ back to a safe posture if the heartbeat stops.
 
 ```
 firmware/     Teensy 4.1 firmware (PlatformIO) and host tests
-ros2_ws/src/  ROS 2 packages: hg_teensy_bridge, hg_description, hg_bringup
+ros2_ws/src/  ROS 2 packages: hg_teensy_bridge, hg_description, hg_bringup, hg_perception
 common/       Code shared by the firmware and the Pi (serial protocol)
 tools/        Pi-side utilities
 docs/         Protocol, kinematics, setup guide, design decisions
@@ -86,6 +86,7 @@ firmware/test_host/run_tests.sh
 - [Serial protocol, posture modes and faults](docs/protocol.md)
 - [Kinematics, reference poses and joint conventions](docs/kinematics.md)
 - [ROS 2 bridge: topics, services and parameters](ros2_ws/src/hg_teensy_bridge/README.md)
+- [Thermal camera driver (MLX90640)](ros2_ws/src/hg_perception/README.md)
 - [Raspberry Pi setup](docs/setup/raspberry-pi.md)
 - [Design decisions](docs/decisions/)
 
