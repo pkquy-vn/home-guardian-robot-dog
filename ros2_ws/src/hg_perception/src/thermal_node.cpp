@@ -34,6 +34,7 @@
 
 extern "C" {
 #include "MLX90640_API.h"
+#include "MLX90640_I2C_Driver.h"  // MLX90640_I2CRead(), used to poll the status register.
 }
 
 namespace {
