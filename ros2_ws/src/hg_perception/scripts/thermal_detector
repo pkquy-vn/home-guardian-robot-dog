@@ -3,21 +3,24 @@
 """thermal_detector: simple person and fire detection on /thermal/image.
 
 Checks every frame (rules in hg_perception/thermal_detection.py), publishes the result on
-/thermal/detections (hg_msgs/ThermalDetections) and logs only when something changes:
-  person detected: N, bearing X deg, +Y C above room
-  no person
-  FIRE: max Z C at bearing X deg
-  fire cleared
+/thermal/detections (hg_msgs/ThermalDetections) and logs only when the held state changes:
+  person detected: N, bearing X deg, +Y C above room   (number of person tracks changed)
+  no person                                           (last track dropped)
+  FIRE: max Z C at bearing X deg                      (fire turned on)
+  fire cleared                                        (fire turned off)
+Parameters are read once at start (config/thermal.yaml).
 """
 
 from __future__ import annotations
 
+import math
 import sys
 
 import rclpy
 from hg_msgs.msg import ThermalDetections, ThermalPerson
 from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.executors import ExternalShutdownException
+from rclpy.logging import get_logger
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, RegionOfInterest
@@ -25,28 +28,26 @@ from sensor_msgs.msg import Image, RegionOfInterest
 from hg_perception.false_color import temperatures_from_image
 from hg_perception.thermal_detection import DetectorParams, Detections, ThermalDetector
 
-# Parameter names and defaults; the type of the default (int or float) is the parameter's type.
+# Parameter name, default and smallest allowed value (None: any number). The type of the default
+# (int or float) is the parameter's type.
 PARAMETERS = (
-    ("person_delta_c", 3.0),
-    ("person_max_c", 40.0),
-    ("person_min_pixels", 3),
-    ("person_min_aspect", 1.5),
-    ("person_min_frames", 3),
-    ("merge_gap_cols", 3),
-    ("fire_min_c", 100.0),
-    ("fire_min_frames", 8),
+    ("person_delta_c", 3.0, None),
+    ("person_max_c", 40.0, None),
+    ("person_min_pixels", 3, 1),
+    ("person_min_aspect", 1.5, 0.0),
+    ("person_min_frames", 3, 1),
+    ("person_clear_frames", 8, 1),
+    ("merge_gap_cols", 3, 0),
+    ("fire_min_c", 100.0, None),
+    ("fire_min_frames", 8, 1),
+    ("fire_clear_frames", 8, 1),
 )
 
 
 class ThermalDetectorNode(Node):
     def __init__(self) -> None:
         super().__init__("thermal_detector")
-        # Dynamic typing accepts 40 as well as 40.0 in YAML; the value is then converted.
-        descriptor = ParameterDescriptor(dynamic_typing=True)
-        values = {}
-        for name, default in PARAMETERS:
-            value = self.declare_parameter(name, default, descriptor).value
-            values[name] = type(default)(value)
+        values = self._read_parameters()
         self._detector = ThermalDetector(DetectorParams(**values))
 
         self._publisher = self.create_publisher(ThermalDetections, "/thermal/detections", 10)
@@ -56,8 +57,28 @@ class ThermalDetectorNode(Node):
         self._person_count = 0
         self._fire = False
         self.get_logger().info(
-            "thermal_detector: " + ", ".join(f"{name}={values[name]}" for name, _ in PARAMETERS)
+            "thermal_detector: " + ", ".join(f"{name}={values[name]}" for name, _, _ in PARAMETERS)
         )
+
+    def _read_parameters(self) -> dict:
+        """Declares and validates the parameters. Raises ValueError with a readable message."""
+        values = {}
+        for name, default, minimum in PARAMETERS:
+            # Dynamic typing accepts 40 as well as 40.0 in YAML. One descriptor per parameter:
+            # rclpy keeps the object it is given.
+            descriptor = ParameterDescriptor(dynamic_typing=True)
+            value = self.declare_parameter(name, default, descriptor).value
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"parameter {name} must be a number, got {value!r}")
+            if not math.isfinite(value):
+                raise ValueError(f"parameter {name} must be finite, got {value!r}")
+            if isinstance(default, int) and value != int(value):
+                raise ValueError(f"parameter {name} must be a whole number, got {value!r}")
+            value = type(default)(value)
+            if minimum is not None and value < minimum:
+                raise ValueError(f"parameter {name} must be at least {minimum}, got {value}")
+            values[name] = value
+        return values
 
     def _on_image(self, msg: Image) -> None:
         try:
@@ -98,7 +119,7 @@ class ThermalDetectorNode(Node):
         if count != self._person_count:
             if count:
                 details = "; ".join(
-                    f"bearing {p.bearing_deg:.0f} deg, +{p.delta_c:.1f} C above room"
+                    f"bearing {round(p.bearing_deg)} deg, +{p.delta_c:.1f} C above room"
                     for p in result.persons
                 )
                 self.get_logger().info(f"person detected: {count}, {details}")
@@ -110,18 +131,22 @@ class ThermalDetectorNode(Node):
         if fire.active != self._fire:
             if fire.active:
                 self.get_logger().error(
-                    f"FIRE: max {fire.max_c:.1f} C at bearing {fire.bearing_deg:.0f} deg"
+                    f"FIRE: max {fire.max_c:.1f} C at bearing {round(fire.bearing_deg)} deg"
                 )
             else:
                 self.get_logger().info("fire cleared")
             self._fire = fire.active
 
 
-def main(args: list[str] | None = None) -> None:
+def main(args: list[str] | None = None) -> int:
     rclpy.init(args=args)
     node = None
     try:
-        node = ThermalDetectorNode()
+        try:
+            node = ThermalDetectorNode()
+        except ValueError as exc:  # Invalid parameters: say which, without a traceback.
+            get_logger("thermal_detector").fatal(f"invalid parameters: {exc}")
+            return 1
         rclpy.spin(node)
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
@@ -129,7 +154,8 @@ def main(args: list[str] | None = None) -> None:
         if node is not None:
             node.destroy_node()
         rclpy.try_shutdown()
+    return 0
 
 
 if __name__ == "__main__":
-    main(sys.argv)
+    sys.exit(main(sys.argv))

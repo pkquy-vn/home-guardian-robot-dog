@@ -9,10 +9,16 @@ of all pixels) and at most person_max_c. Touching person-warm pixels (8-neighbou
 clusters with at most merge_gap_cols empty columns between their column ranges are merged (a close
 person shows as two legs, because the camera is low). A merged cluster is a candidate if it has at
 least person_min_pixels pixels and is at least person_min_aspect times taller (rows) than wide
-(columns). A candidate counts as a person once a candidate with overlapping columns has been seen
-in person_min_frames consecutive frames.
+(columns).
 
-Fire: any pixel at or above fire_min_c in fire_min_frames consecutive frames.
+Person tracks: a candidate becomes a confirmed person track after matching candidates in
+person_min_frames consecutive frames. A track is dropped only after person_clear_frames
+consecutive frames without a match; until then it is reported with its last seen box and values.
+Candidates match tracks when their column ranges overlap or are at most merge_gap_cols empty
+columns apart (movement between frames).
+
+Fire: turns on when a pixel is at or above fire_min_c in fire_min_frames consecutive frames, and
+off when no pixel has reached fire_min_c for fire_clear_frames consecutive frames.
 """
 
 from __future__ import annotations
@@ -20,7 +26,7 @@ from __future__ import annotations
 import math
 import statistics
 from dataclasses import dataclass
-from typing import Callable, Optional, Sequence
+from typing import Callable, Sequence
 
 HORIZONTAL_FOV_DEG = 110.0  # MLX90640 110 x 75 deg version: 110 deg across the 32 columns.
 
@@ -32,9 +38,11 @@ class DetectorParams:
     person_min_pixels: int = 3
     person_min_aspect: float = 1.5
     person_min_frames: int = 3
+    person_clear_frames: int = 8
     merge_gap_cols: int = 3
     fire_min_c: float = 100.0
     fire_min_frames: int = 8
+    fire_clear_frames: int = 8
 
 
 @dataclass
@@ -73,14 +81,14 @@ class Cluster:
 class Person:
     box: Cluster
     peak_c: float
-    delta_c: float  # peak_c minus room temperature
+    delta_c: float  # peak_c minus room temperature, when last seen
     bearing_deg: float
 
 
 @dataclass
 class Fire:
     active: bool
-    max_c: float  # Warmest pixel of the frame, also when not active.
+    max_c: float  # Warmest pixel of the current frame, also when not active.
     col: int
     row: int
     bearing_deg: float
@@ -89,7 +97,7 @@ class Fire:
 @dataclass
 class Detections:
     room_c: float
-    persons: list[Person]
+    persons: list[Person]  # Confirmed tracks, including those held without a match this frame.
     fire: Fire
 
 
@@ -140,6 +148,11 @@ def find_clusters(
     return clusters
 
 
+def column_gap(a: Cluster, b: Cluster) -> int:
+    """Empty columns between two column ranges: 0 if adjacent, negative if they overlap."""
+    return max(a.col_min, b.col_min) - min(a.col_max, b.col_max) - 1
+
+
 def merge_by_columns(clusters: Sequence[Cluster], max_gap_cols: int) -> list[Cluster]:
     """Merges clusters whose column ranges have at most max_gap_cols empty columns between them."""
     merged: list[Cluster] = []
@@ -151,49 +164,110 @@ def merge_by_columns(clusters: Sequence[Cluster], max_gap_cols: int) -> list[Clu
     return merged
 
 
-def columns_overlap(a: Cluster, b: Cluster) -> int:
-    """Number of shared columns (0 or less if none)."""
-    return min(a.col_max, b.col_max) - max(a.col_min, b.col_min) + 1
+@dataclass
+class _Track:
+    person: Person  # Last matched candidate.
+    hits: int = 1  # Consecutive matched frames (counts up to confirmation).
+    misses: int = 0  # Consecutive frames without a match (confirmed tracks only).
+
+
+def _match(
+    tracks: Sequence[_Track], candidates: Sequence[Person], max_gap_cols: int
+) -> list[tuple[int, int]]:
+    """One-to-one (track index, candidate index) pairs, closest column ranges first."""
+    pairs = []
+    for t, track in enumerate(tracks):
+        for c, candidate in enumerate(candidates):
+            gap = column_gap(track.person.box, candidate.box)
+            if gap <= max_gap_cols:
+                pairs.append((gap, -candidate.box.pixels, t, c))
+    pairs.sort()
+    used_tracks: set[int] = set()
+    used_candidates: set[int] = set()
+    matches = []
+    for _, _, t, c in pairs:
+        if t not in used_tracks and c not in used_candidates:
+            used_tracks.add(t)
+            used_candidates.add(c)
+            matches.append((t, c))
+    return matches
 
 
 class PersonTracker:
-    """Confirms candidates seen, with overlapping columns, in min_frames consecutive frames."""
+    """Confirms candidates over min_frames frames and holds confirmed tracks for clear_frames."""
 
-    def __init__(self, min_frames: int) -> None:
+    def __init__(self, min_frames: int, clear_frames: int, max_gap_cols: int) -> None:
         self._min_frames = max(1, min_frames)
-        self._tracks: list[tuple[Cluster, int]] = []  # Last frame's candidates and their streaks.
+        self._clear_frames = max(1, clear_frames)
+        self._max_gap_cols = max_gap_cols
+        self._confirmed: list[_Track] = []
+        self._pending: list[_Track] = []
 
-    def update(self, candidates: Sequence[Cluster]) -> list[Cluster]:
-        previous = list(self._tracks)
-        tracks: list[tuple[Cluster, int]] = []
-        confirmed: list[Cluster] = []
-        for candidate in sorted(candidates, key=lambda c: c.pixels, reverse=True):
-            best: Optional[int] = None
-            best_overlap = 0
-            for index, (track, _) in enumerate(previous):
-                overlap = columns_overlap(candidate, track)
-                if overlap > best_overlap:
-                    best, best_overlap = index, overlap
-            streak = previous.pop(best)[1] + 1 if best is not None else 1
-            streak = min(streak, self._min_frames)
-            tracks.append((candidate, streak))
-            if streak >= self._min_frames:
-                confirmed.append(candidate)
-        self._tracks = tracks
-        return sorted(confirmed, key=lambda c: c.col_min)
+    def update(self, candidates: Sequence[Person]) -> list[Person]:
+        """Feeds one frame's candidates; returns the confirmed persons, left to right."""
+        # Confirmed tracks get the first pick of the candidates.
+        matched_tracks = set()
+        used = set()
+        for t, c in _match(self._confirmed, candidates, self._max_gap_cols):
+            self._confirmed[t].person = candidates[c]
+            self._confirmed[t].misses = 0
+            matched_tracks.add(t)
+            used.add(c)
+        for t, track in enumerate(self._confirmed):
+            if t not in matched_tracks:
+                track.misses += 1
+        self._confirmed = [t for t in self._confirmed if t.misses < self._clear_frames]
+
+        # The rest extend pending tracks (which must match every frame) or start new ones.
+        remaining = [p for c, p in enumerate(candidates) if c not in used]
+        pending = []
+        matched_remaining = set()
+        for t, c in _match(self._pending, remaining, self._max_gap_cols):
+            track = self._pending[t]
+            track.person = remaining[c]
+            track.hits += 1
+            pending.append(track)
+            matched_remaining.add(c)
+        pending.extend(
+            _Track(person) for c, person in enumerate(remaining) if c not in matched_remaining
+        )
+
+        self._pending = []
+        for track in pending:
+            if track.hits >= self._min_frames:
+                track.misses = 0
+                self._confirmed.append(track)
+            else:
+                self._pending.append(track)
+        return sorted((t.person for t in self._confirmed), key=lambda p: p.box.col_min)
 
 
 class FireMonitor:
-    """Fire while the frame maximum has been >= min_c for min_frames consecutive frames."""
+    """On after min_frames consecutive hot frames, off after clear_frames consecutive cool ones.
 
-    def __init__(self, min_c: float, min_frames: int) -> None:
+    A frame is hot when its warmest pixel is at or above min_c.
+    """
+
+    def __init__(self, min_c: float, min_frames: int, clear_frames: int) -> None:
         self._min_c = min_c
         self._min_frames = max(1, min_frames)
+        self._clear_frames = max(1, clear_frames)
         self._hot_frames = 0
+        self._cool_frames = 0
+        self.active = False
 
     def update(self, max_c: float) -> bool:
-        self._hot_frames = self._hot_frames + 1 if max_c >= self._min_c else 0
-        return self._hot_frames >= self._min_frames
+        if max_c >= self._min_c:
+            self._hot_frames += 1
+            self._cool_frames = 0
+        else:
+            self._cool_frames += 1
+            self._hot_frames = 0
+        if not self.active and self._hot_frames >= self._min_frames:
+            self.active = True
+        elif self.active and self._cool_frames >= self._clear_frames:
+            self.active = False
+        return self.active
 
 
 class ThermalDetector:
@@ -201,8 +275,12 @@ class ThermalDetector:
 
     def __init__(self, params: DetectorParams) -> None:
         self.params = params
-        self._tracker = PersonTracker(params.person_min_frames)
-        self._fire = FireMonitor(params.fire_min_c, params.fire_min_frames)
+        self._tracker = PersonTracker(
+            params.person_min_frames, params.person_clear_frames, params.merge_gap_cols
+        )
+        self._fire = FireMonitor(
+            params.fire_min_c, params.fire_min_frames, params.fire_clear_frames
+        )
 
     def process(self, values: Sequence[float], width: int, height: int) -> Detections:
         """Detects persons and fire in one image. Raises ValueError for an all-NaN image."""
@@ -212,14 +290,11 @@ class ThermalDetector:
         low, high = room + p.person_delta_c, p.person_max_c
         clusters = find_clusters(values, width, height, lambda t: low <= t <= high)
         candidates = [
-            c
+            Person(c, c.peak_c, c.peak_c - room, bearing_deg(c.center_col, width))
             for c in merge_by_columns(clusters, p.merge_gap_cols)
             if c.pixels >= p.person_min_pixels and c.height >= p.person_min_aspect * c.width
         ]
-        persons = [
-            Person(c, c.peak_c, c.peak_c - room, bearing_deg(c.center_col, width))
-            for c in self._tracker.update(candidates)
-        ]
+        persons = self._tracker.update(candidates)
 
         hottest = max(
             (i for i, v in enumerate(values) if math.isfinite(v)), key=lambda i: values[i]

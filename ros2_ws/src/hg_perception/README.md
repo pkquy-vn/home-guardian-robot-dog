@@ -52,11 +52,15 @@ the median of all 768 pixels.
   `person_max_c` are grouped into touching clusters (8-neighbour). Clusters at most
   `merge_gap_cols` empty columns apart are merged, so a close person's two legs become one. A
   cluster with at least `person_min_pixels` pixels that is at least `person_min_aspect` times
-  taller than wide is a candidate. It counts as a person once a candidate with overlapping
-  columns has been seen in `person_min_frames` frames in a row. This is tuned for standing
-  people seen by a camera 19 cm above the floor; pets and wide objects such as TVs are rejected.
-- **Fire:** any pixel at or above `fire_min_c` in `fire_min_frames` frames in a row. It clears on
-  the first frame below the threshold.
+  taller than wide is a candidate. This is tuned for standing people seen by a camera 19 cm above
+  the floor; pets and wide objects such as TVs are rejected.
+- **Person tracks:** a candidate becomes a person track after matching candidates in
+  `person_min_frames` frames in a row. A track is dropped only after `person_clear_frames` frames
+  in a row without a match, and until then it is reported with its last seen box and values.
+  Candidates match a track when their columns overlap or are at most `merge_gap_cols` apart.
+- **Fire:** turns on when any pixel is at or above `fire_min_c` in `fire_min_frames` frames in a
+  row, and off after `fire_clear_frames` frames in a row with no pixel that hot. While on, the
+  message carries the current frame's warmest pixel.
 - **Bearing:** 0 = straight ahead, positive = the robot's left, 110 deg across the 32 columns
   (the driver's flips make the image's left the robot's left).
 
@@ -65,7 +69,8 @@ the median of all 768 pixels.
 | `/thermal/detections` | `hg_msgs/ThermalDetections` | Every frame: header of the image, room temperature, confirmed persons (pixel box, peak, degrees above room, bearing), fire flag with the frame's warmest pixel and its bearing |
 
 The parameters and their defaults are in [`config/thermal.yaml`](config/thermal.yaml), each with
-a comment. The node logs only when something changes:
+a comment, and are read once at start. The node logs only when the held state changes (the
+number of person tracks, or fire on or off), so each real event gives one line:
 
 ```
 person detected: 1, bearing 12 deg, +7.4 C above room
@@ -93,7 +98,8 @@ example by event alerts.
 ## Requirements
 
 Only packages that come with ROS 2 Jazzy (`ros-base`, `ros-dev-tools`). I2C must be enabled and
-the user must be in the `i2c` group (see [docs/setup/raspberry-pi.md](../../../docs/setup/raspberry-pi.md)).
+the user must be in the `i2c` group (see
+[docs/setup/raspberry-pi.md](../../../docs/setup/raspberry-pi.md)).
 
 ## License
 
