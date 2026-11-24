@@ -35,8 +35,8 @@ target_link_libraries(thermal_node
 install(TARGETS thermal_node DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
 
-# Python: the reusable hg_perception module and the thermal_snapshot executable.
+# Python: the reusable hg_perception modules and the thermal_snapshot and thermal_detector tools.
 ament_python_install_package(${PROJECT_NAME})
-install(PROGRAMS scripts/thermal_snapshot DESTINATION lib/${PROJECT_NAME})
+install(PROGRAMS scripts/thermal_snapshot scripts/thermal_detector DESTINATION lib/${PROJECT_NAME})
 
 ament_package()

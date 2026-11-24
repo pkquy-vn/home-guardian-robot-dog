@@ -11,3 +11,15 @@ thermal_node:
     flip_vertical: false      # true if the image is upside down
     frame_id: thermal_link
     log_stats: true           # Once per second: min, max, mean, center temperature and rate
+
+# Person and fire detection (thermal_detector). Room temperature = median of all pixels.
+thermal_detector:
+  ros__parameters:
+    person_delta_c: 3.0       # Person-warm pixel: at least this much above room temperature ...
+    person_max_c: 40.0        # ... and at most this hot (rejects heaters, lamps, hot appliances)
+    person_min_pixels: 3      # Smallest person cluster, in pixels
+    person_min_aspect: 1.5    # Height (rows) >= this x width (cols): standing people, not pets/TVs
+    person_min_frames: 3      # Frames in a row a cluster must be seen before it counts as a person
+    merge_gap_cols: 3         # Merge clusters at most this many empty columns apart (two legs)
+    fire_min_c: 100.0         # Fire if any pixel is at least this hot ...
+    fire_min_frames: 8        # ... in this many frames in a row (about 1 s at 8 Hz)

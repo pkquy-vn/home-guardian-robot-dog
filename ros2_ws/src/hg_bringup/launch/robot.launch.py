@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Starts the Teensy bridge and robot_state_publisher with the hg_description model.
+"""Starts the Teensy bridge, robot_state_publisher with the hg_description model, and the thermal
+camera (thermal_node and thermal_detector).
 
 Example:
     ros2 launch hg_bringup robot.launch.py port:=/dev/ttyACM0
@@ -26,10 +27,15 @@ def generate_launch_description() -> LaunchDescription:
         get_package_share_directory("hg_description"), "urdf", "hg.urdf.xacro"
     )
     robot_description = ParameterValue(Command(["xacro ", urdf_xacro]), value_type=str)
+    # If the thermal camera is missing, thermal_node keeps retrying; nothing else is affected.
+    thermal_launch = os.path.join(
+        get_package_share_directory("hg_perception"), "launch", "thermal.launch.py"
+    )
 
     return LaunchDescription(
         [
             IncludeLaunchDescription(PythonLaunchDescriptionSource(bridge_launch)),
+            IncludeLaunchDescription(PythonLaunchDescriptionSource(thermal_launch)),
             Node(
                 package="robot_state_publisher",
                 executable="robot_state_publisher",

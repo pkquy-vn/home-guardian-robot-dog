@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Starts thermal_node with config/thermal.yaml.
+"""Starts thermal_node (MLX90640 driver) and thermal_detector with config/thermal.yaml.
 
 Example:
     ros2 launch hg_perception thermal.launch.py
-    ros2 launch hg_perception thermal.launch.py config:=/path/to/other.yaml
+    ros2 launch hg_perception thermal.launch.py thermal_config:=/path/to/other.yaml
 """
 
 from launch import LaunchDescription
@@ -20,14 +20,23 @@ def generate_launch_description() -> LaunchDescription:
     return LaunchDescription(
         [
             DeclareLaunchArgument(
-                "config", default_value=default_config, description="thermal_node parameter file"
+                "thermal_config",
+                default_value=default_config,
+                description="Parameter file for thermal_node and thermal_detector",
             ),
             Node(
                 package="hg_perception",
                 executable="thermal_node",
                 name="thermal_node",
                 output="screen",
-                parameters=[LaunchConfiguration("config")],
+                parameters=[LaunchConfiguration("thermal_config")],
+            ),
+            Node(
+                package="hg_perception",
+                executable="thermal_detector",
+                name="thermal_detector",
+                output="screen",
+                parameters=[LaunchConfiguration("thermal_config")],
             ),
         ]
     )

@@ -1,8 +1,8 @@
 # hg_perception
 
 Perception for Home Guardian. Today: a driver for the Melexis MLX90640 thermal camera (32 x 24
-pixels, 110 deg version) on the Raspberry Pi's I2C bus, and a false-color snapshot tool. Camera and
-detection nodes will join this package later.
+pixels, 110 deg version) on the Raspberry Pi's I2C bus, simple person and fire detection on its
+image, and a false-color snapshot tool. A camera node will join this package later.
 
 ## thermal_node (C++)
 
@@ -41,6 +41,41 @@ ros2 launch hg_perception thermal.launch.py
 **Orientation:** the image should look like a normal camera's. An object on the sensor's left,
 seen from behind the sensor, should appear on the left of the image. Check it with a snapshot
 and set `flip_horizontal` / `flip_vertical` in `config/thermal.yaml` if needed.
+
+## thermal_detector (Python)
+
+Simple person and fire detection on every `/thermal/image` frame, standard library only (rules in
+[`hg_perception/thermal_detection.py`](hg_perception/thermal_detection.py)). Room temperature is
+the median of all 768 pixels.
+
+- **Person** (works in darkness): pixels at least `person_delta_c` above room and at most
+  `person_max_c` are grouped into touching clusters (8-neighbour). Clusters at most
+  `merge_gap_cols` empty columns apart are merged, so a close person's two legs become one. A
+  cluster with at least `person_min_pixels` pixels that is at least `person_min_aspect` times
+  taller than wide is a candidate. It counts as a person once a candidate with overlapping
+  columns has been seen in `person_min_frames` frames in a row. This is tuned for standing
+  people seen by a camera 19 cm above the floor; pets and wide objects such as TVs are rejected.
+- **Fire:** any pixel at or above `fire_min_c` in `fire_min_frames` frames in a row. It clears on
+  the first frame below the threshold.
+- **Bearing:** 0 = straight ahead, positive = the robot's left, 110 deg across the 32 columns
+  (the driver's flips make the image's left the robot's left).
+
+| Topic | Type | Content |
+| --- | --- | --- |
+| `/thermal/detections` | `hg_msgs/ThermalDetections` | Every frame: header of the image, room temperature, confirmed persons (pixel box, peak, degrees above room, bearing), fire flag with the frame's warmest pixel and its bearing |
+
+The parameters and their defaults are in [`config/thermal.yaml`](config/thermal.yaml), each with
+a comment. The node logs only when something changes:
+
+```
+person detected: 1, bearing 12 deg, +7.4 C above room
+no person
+FIRE: max 182.0 C at bearing -20 deg
+fire cleared
+```
+
+`ros2 launch hg_perception thermal.launch.py` starts the driver and the detector; `hg_bringup`'s
+`robot.launch.py` includes it, so both start with the robot.
 
 ## thermal_snapshot (Python)
 

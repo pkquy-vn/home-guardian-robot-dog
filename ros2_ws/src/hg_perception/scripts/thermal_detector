@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""thermal_detector: simple person and fire detection on /thermal/image.
+
+Checks every frame (rules in hg_perception/thermal_detection.py), publishes the result on
+/thermal/detections (hg_msgs/ThermalDetections) and logs only when something changes:
+  person detected: N, bearing X deg, +Y C above room
+  no person
+  FIRE: max Z C at bearing X deg
+  fire cleared
+"""
+
+from __future__ import annotations
+
+import sys
+
+import rclpy
+from hg_msgs.msg import ThermalDetections, ThermalPerson
+from rcl_interfaces.msg import ParameterDescriptor
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import Image, RegionOfInterest
+
+from hg_perception.false_color import temperatures_from_image
+from hg_perception.thermal_detection import DetectorParams, Detections, ThermalDetector
+
+# Parameter names and defaults; the type of the default (int or float) is the parameter's type.
+PARAMETERS = (
+    ("person_delta_c", 3.0),
+    ("person_max_c", 40.0),
+    ("person_min_pixels", 3),
+    ("person_min_aspect", 1.5),
+    ("person_min_frames", 3),
+    ("merge_gap_cols", 3),
+    ("fire_min_c", 100.0),
+    ("fire_min_frames", 8),
+)
+
+
+class ThermalDetectorNode(Node):
+    def __init__(self) -> None:
+        super().__init__("thermal_detector")
+        # Dynamic typing accepts 40 as well as 40.0 in YAML; the value is then converted.
+        descriptor = ParameterDescriptor(dynamic_typing=True)
+        values = {}
+        for name, default in PARAMETERS:
+            value = self.declare_parameter(name, default, descriptor).value
+            values[name] = type(default)(value)
+        self._detector = ThermalDetector(DetectorParams(**values))
+
+        self._publisher = self.create_publisher(ThermalDetections, "/thermal/detections", 10)
+        # Best effort: matches the driver's reliable publisher as well.
+        self.create_subscription(Image, "/thermal/image", self._on_image, qos_profile_sensor_data)
+
+        self._person_count = 0
+        self._fire = False
+        self.get_logger().info(
+            "thermal_detector: " + ", ".join(f"{name}={values[name]}" for name, _ in PARAMETERS)
+        )
+
+    def _on_image(self, msg: Image) -> None:
+        try:
+            values, width, height = temperatures_from_image(msg)
+            result = self._detector.process(values, width, height)
+        except ValueError as exc:
+            self.get_logger().warning(f"skipping thermal image: {exc}", throttle_duration_sec=10.0)
+            return
+        self._publisher.publish(self._to_message(msg, result))
+        self._log_changes(result)
+
+    @staticmethod
+    def _to_message(image: Image, result: Detections) -> ThermalDetections:
+        out = ThermalDetections()
+        out.header = image.header
+        out.room_c = float(result.room_c)
+        for person in result.persons:
+            item = ThermalPerson()
+            item.bbox = RegionOfInterest(
+                x_offset=person.box.col_min,
+                y_offset=person.box.row_min,
+                width=person.box.width,
+                height=person.box.height,
+            )
+            item.peak_c = float(person.peak_c)
+            item.delta_c = float(person.delta_c)
+            item.bearing_deg = float(person.bearing_deg)
+            out.persons.append(item)
+        out.fire = result.fire.active
+        out.fire_max_c = float(result.fire.max_c)
+        out.fire_col = result.fire.col
+        out.fire_row = result.fire.row
+        out.fire_bearing_deg = float(result.fire.bearing_deg)
+        return out
+
+    def _log_changes(self, result: Detections) -> None:
+        count = len(result.persons)
+        if count != self._person_count:
+            if count:
+                details = "; ".join(
+                    f"bearing {p.bearing_deg:.0f} deg, +{p.delta_c:.1f} C above room"
+                    for p in result.persons
+                )
+                self.get_logger().info(f"person detected: {count}, {details}")
+            else:
+                self.get_logger().info("no person")
+            self._person_count = count
+
+        fire = result.fire
+        if fire.active != self._fire:
+            if fire.active:
+                self.get_logger().error(
+                    f"FIRE: max {fire.max_c:.1f} C at bearing {fire.bearing_deg:.0f} deg"
+                )
+            else:
+                self.get_logger().info("fire cleared")
+            self._fire = fire.active
+
+
+def main(args: list[str] | None = None) -> None:
+    rclpy.init(args=args)
+    node = None
+    try:
+        node = ThermalDetectorNode()
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        if node is not None:
+            node.destroy_node()
+        rclpy.try_shutdown()
+
+
+if __name__ == "__main__":
+    main(sys.argv)
