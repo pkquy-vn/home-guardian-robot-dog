@@ -6,7 +6,7 @@
 // Every input takes the current time in milliseconds (millis() on the Teensy); all time
 // arithmetic is unsigned and therefore safe across the 32-bit wrap.
 //
-// Modes and transitions (no servos yet: timed transitions stand in for joint interpolation):
+// Modes and transitions (a transition is timed here; the joints follow it, see joint_motion.h):
 //   - Boot mode is LIE. STATUS reports the old mode until a transition completes.
 //   - LIE, SIT and STAND can be requested from each other. WALK only from STAND; from WALK only
 //     STAND. From TORQUE_OFF only LIE. LIE -> STAND takes 1.6 s, every other transition 1.0 s.
@@ -27,6 +27,12 @@
 //       TORQUE_OFF: stay.
 //   - The pending TORQUE_OFF is cancelled only by an accepted CLEAR_FAULT, not by heartbeats
 //     resuming.
+//
+// Servo faults (kServoFaults) are detected and latched outside this class (joint_control.h) and
+// passed in with set_external_faults(). While any is set, requests are rejected as for
+// HEARTBEAT_LOST. Response:
+//   - SERVO_OVERHEAT, SERVO_OVERCURRENT, SERVO_MISSING, SERVO_TORQUE_LOST: TORQUE_OFF at once.
+//   - SERVO_HOT: move to LIE (1.0 s), unless in or moving to LIE, or in TORQUE_OFF.
 
 #ifndef HG_FIRMWARE_POSTURE_H_
 #define HG_FIRMWARE_POSTURE_H_
@@ -66,6 +72,9 @@ class PostureStateMachine {
   RequestResult request_mode(uint8_t mode, uint32_t now_ms);
   ClearResult clear_fault(uint32_t now_ms);
   void tick(uint32_t now_ms);
+  // The servo fault bits currently latched by the caller (other bits are ignored). Call on
+  // every control tick; applies the response described above.
+  void set_external_faults(uint16_t bits, uint32_t now_ms);
 
   // Outputs.
   Mode reported_mode() const { return current_; }
@@ -104,6 +113,7 @@ class PostureStateMachine {
   bool link_lost_ = false;         // Currently more than kHeartbeatTimeoutMs since the last one.
   uint32_t last_heartbeat_ms_ = 0;
   bool latched_ = false;
+  uint16_t external_faults_ = 0;  // Servo fault bits, latched by the caller.
 
   bool torque_off_pending_ = false;
   uint32_t torque_off_loss_ms_ = 0;  // Time of the loss that scheduled the pending TORQUE_OFF.

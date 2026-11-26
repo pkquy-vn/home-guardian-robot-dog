@@ -40,13 +40,18 @@ bool ServoBus::start_read(uint8_t id, uint8_t address, uint8_t count, uint32_t n
 bool ServoBus::start_write(uint8_t id, uint8_t address, const uint8_t* data, uint8_t count,
                            uint32_t now_us) {
   if (!writes_enabled_ || busy()) return false;
+  if (!sts::is_allowed_write(address, count, data)) return false;
   return transmit(sts::build_write(id, address, data, count, request_, sizeof(request_)), true, id,
                   0, now_us);
 }
 
 bool ServoBus::start_sync_write(uint8_t address, uint8_t bytes_per_servo, const uint8_t* ids,
                                 const uint8_t* data, uint8_t servo_count, uint32_t now_us) {
-  if (!writes_enabled_ || busy()) return false;
+  if (!writes_enabled_ || busy() || data == nullptr) return false;
+  for (uint8_t i = 0; i < servo_count; ++i) {
+    const uint8_t* servo_data = data + static_cast<size_t>(i) * bytes_per_servo;
+    if (!sts::is_allowed_write(address, bytes_per_servo, servo_data)) return false;
+  }
   return transmit(sts::build_sync_write(address, bytes_per_servo, ids, data, servo_count, request_,
                                         sizeof(request_)),
                   false, 0, 0, now_us);

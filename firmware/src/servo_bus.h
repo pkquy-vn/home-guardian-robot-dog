@@ -11,8 +11,11 @@
 //     comes first. Nothing waits for the servo.
 // Not for use from an interrupt: call everything from loop().
 //
-// Never moves a servo unless told to: WRITE and SYNC WRITE are refused until
-// set_writes_enabled(true). Nothing calls that in S1, so the firmware only sends PING and READ.
+// Writes are guarded twice:
+//   - WRITE and SYNC WRITE are refused until set_writes_enabled(true);
+//   - even then, only torque enable (0 or 1) and the goal registers can be written
+//     (sts::is_allowed_write): never a servo's EEPROM, its EEPROM lock, or the value 128 to
+//     torque enable, which would store a new zero offset in the servo.
 
 #ifndef HG_FIRMWARE_SERVO_BUS_H_
 #define HG_FIRMWARE_SERVO_BUS_H_
@@ -20,6 +23,7 @@
 #include <Arduino.h>
 
 #include "servo_packet.h"
+#include "servo_registers.h"
 
 namespace hg {
 
@@ -43,11 +47,12 @@ class ServoBus {
   // without blocking. `now_us` is micros().
   bool start_ping(uint8_t id, uint32_t now_us);
   bool start_read(uint8_t id, uint8_t address, uint8_t count, uint32_t now_us);
-  // Refused unless writes are enabled (see set_writes_enabled).
+  // Refused unless writes are enabled and the write is allowed (see above).
   bool start_write(uint8_t id, uint8_t address, const uint8_t* data, uint8_t count,
                    uint32_t now_us);
-  // Broadcast, no reply. Refused unless writes are enabled. A sync write to 8 servos is longer
-  // than the Teensy's default 64-byte transmit buffer: S2 must add transmit memory to the port.
+  // Broadcast, no reply. Refused unless writes are enabled and the write is allowed for every
+  // servo. A sync write of a goal to 8 servos is 72 bytes, more than the Teensy's default
+  // 64-byte transmit buffer: the port needs extra transmit memory (addMemoryForWrite).
   bool start_sync_write(uint8_t address, uint8_t bytes_per_servo, const uint8_t* ids,
                         const uint8_t* data, uint8_t servo_count, uint32_t now_us);
 

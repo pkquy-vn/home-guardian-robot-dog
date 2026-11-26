@@ -36,7 +36,8 @@ uint32_t PostureStateMachine::transition_duration_ms(Mode from, Mode to) {
 
 uint16_t PostureStateMachine::fault_bits() const {
   // Before the first heartbeat the bit is set but not latched; it clears on that heartbeat.
-  return (!link_established_ || latched_) ? kFaultHeartbeatLost : 0;
+  const uint16_t heartbeat = (!link_established_ || latched_) ? kFaultHeartbeatLost : 0;
+  return static_cast<uint16_t>(heartbeat | external_faults_);
 }
 
 bool PostureStateMachine::heartbeat_healthy(uint32_t now_ms) const {
@@ -94,6 +95,21 @@ ClearResult PostureStateMachine::clear_fault(uint32_t now_ms) {
 }
 
 void PostureStateMachine::tick(uint32_t now_ms) { advance(now_ms); }
+
+void PostureStateMachine::set_external_faults(uint16_t bits, uint32_t now_ms) {
+  advance(now_ms);
+  external_faults_ = static_cast<uint16_t>(bits & kServoFaults);
+  if (external_faults_ & kTorqueOffFaults) {
+    if (current_ != Mode::kTorqueOff || in_transition_) enter_torque_off();
+    return;
+  }
+  if (external_faults_ & kFaultServoHot) {
+    const Mode effective = in_transition_ ? target_ : current_;
+    if (effective != Mode::kLie && effective != Mode::kTorqueOff) {
+      start_transition(Mode::kLie, now_ms);  // Aborts any transition in progress.
+    }
+  }
+}
 
 // Brings the state up to now_ms. Called first by every input, so the result does not depend on
 // whether a control tick happened to run between two events.

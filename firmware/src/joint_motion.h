@@ -6,7 +6,8 @@
 // transition started (so an aborted transition starts from where the legs are) to the target
 // reference pose, over the transition time, with a minimum-jerk profile (zero velocity and
 // acceleration at both ends). In a stable mode the reference pose is held; in TORQUE_OFF the
-// last commanded angles are held. No servos yet: the angles are only reported in JOINT_STATE.
+// last commanded angles are held. These are posture targets: joint_control.h rate-limits them
+// and sends them to the servos that are driven.
 
 #ifndef HG_FIRMWARE_JOINT_MOTION_H_
 #define HG_FIRMWARE_JOINT_MOTION_H_
