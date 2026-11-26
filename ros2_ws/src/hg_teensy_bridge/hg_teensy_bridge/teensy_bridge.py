@@ -8,7 +8,9 @@ Implements what the firmware supports today:
   - parses STATUS and publishes /teensy/mode, /teensy/faults, /teensy/connected and
     /diagnostics;
   - parses JOINT_STATE and publishes /joint_states (sensor_msgs/JointState, radians), with the
-    joint names of the hg_description URDF.
+    joint names of the hg_description URDF;
+  - parses SERVO_STATE (bus servo telemetry) and adds one DiagnosticStatus per servo to
+    /diagnostics; logs when a servo appears or goes missing.
 
 Safety: the heartbeat tells the Teensy that the Pi-side software is alive; the firmware raises
 HEARTBEAT_LOST after 500 ms without one. The heartbeat is therefore sent from a timer on this
@@ -43,12 +45,20 @@ CONNECTED_PERIOD_S = 0.5  # /teensy/connected publish period (2 Hz), plus on cha
 DIAGNOSTICS_PERIOD_S = 1.0  # /diagnostics publish period.
 WRITE_TIMEOUT_S = 0.02  # Upper bound on a heartbeat write if the OS transmit buffer is full.
 MAX_READ_BYTES = 4096  # Upper bound on bytes read per poll.
+SERVO_STALE_S = 1.0  # SERVO_STATE (10 Hz per servo) older than this is reported as stale.
+SERVO_WARN_TEMP_C = 60  # Servo diagnostics: WARN at or above this temperature ...
+SERVO_ERROR_TEMP_C = 70  # ... and ERROR at or above this one.
 
 # URDF joint names (hg_description) in JOINT_STATE order: FL hip, FL knee, FR hip, ... RR knee.
 # The URDF joint values equal the firmware hip and knee angles (docs/kinematics.md).
 JOINT_NAMES = [
     f"{leg}_{joint}_joint" for leg in ("fl", "fr", "rl", "rr") for joint in ("hip", "knee")
 ]
+
+
+def servo_name(index: int) -> str:
+    """Diagnostics name of servo ID index + 1, for example "servo 2 FL knee"."""
+    return f"servo {index + 1} {protocol.JOINT_ORDER[index]}"
 
 
 class TeensyBridge(Node):
@@ -92,6 +102,12 @@ class TeensyBridge(Node):
         self._status_in_window = 0
         self._window_start = time.monotonic()
         self._stopping = False
+
+        # Latest SERVO_STATE entry per servo (index = ID - 1) and when it arrived:
+        # (present, position, speed, load, current, voltage, temperature, status).
+        self._servos: list[Optional[tuple]] = [None] * protocol.NUM_SERVOS
+        self._servo_times = [0.0] * protocol.NUM_SERVOS
+        self._servo_presence: Optional[list[bool]] = None  # As last logged.
 
         # All timers use the node's default callback group (mutually exclusive) on the executor
         # that spins this node. Do not move the heartbeat to its own thread or callback group.
@@ -157,6 +173,9 @@ class TeensyBridge(Node):
                 pass
             self._serial = None
         self._last_status_time = None
+        # Forget the servo states: after a reconnect the presence summary is logged again.
+        self._servos = [None] * protocol.NUM_SERVOS
+        self._servo_presence = None
         if not self._unavailable_reported:
             self.get_logger().warning(
                 f"lost {self._port_name}: {reason}; retrying every {RECONNECT_PERIOD_S:g} s"
@@ -239,6 +258,8 @@ class TeensyBridge(Node):
                     self._handle_status(payload)
                 elif msg_type == protocol.JOINT_STATE:
                     self._handle_joint_state(payload)
+                elif msg_type == protocol.SERVO_STATE:
+                    self._handle_servo_state(payload)
         self._update_connected()
 
     def _handle_joint_state(self, payload: bytes) -> None:
@@ -252,6 +273,37 @@ class TeensyBridge(Node):
         # published: their units are not defined yet.
         msg.position = [math.radians(position_cdeg / 100.0) for position_cdeg, _, _ in joints]
         self._joint_state_pub.publish(msg)
+
+    def _handle_servo_state(self, payload: bytes) -> None:
+        decoded = protocol.unpack_servo_state(payload)
+        if decoded is None:
+            return
+        first_id, servos = decoded
+        now = time.monotonic()
+        for offset, servo in enumerate(servos):
+            self._servos[first_id - 1 + offset] = servo
+            self._servo_times[first_id - 1 + offset] = now
+        self._log_servo_presence()
+
+    def _log_servo_presence(self) -> None:
+        """Logs one summary when all servo states are first known, then only changes."""
+        if any(servo is None for servo in self._servos):
+            return  # Wait until both SERVO_STATE groups have arrived.
+        present = [bool(servo[0]) for servo in self._servos]
+        if self._servo_presence is None:
+            found = [servo_name(i) for i, here in enumerate(present) if here]
+            missing = [str(i + 1) for i, here in enumerate(present) if not here]
+            self.get_logger().info(
+                f"servos present: {', '.join(found) or 'none'}; "
+                f"missing IDs: {', '.join(missing) or 'none'}"
+            )
+        else:
+            for i, (was, here) in enumerate(zip(self._servo_presence, present)):
+                if here and not was:
+                    self.get_logger().info(f"{servo_name(i)}: present")
+                elif was and not here:
+                    self.get_logger().warning(f"{servo_name(i)}: missing")
+        self._servo_presence = present
 
     def _handle_status(self, payload: bytes) -> None:
         status = protocol.unpack_status(payload)
@@ -335,8 +387,58 @@ class TeensyBridge(Node):
         ]
         array = DiagnosticArray()
         array.header.stamp = self.get_clock().now().to_msg()
-        array.status = [diag]
+        array.status = [diag] + [
+            self._servo_diagnostics(index, now) for index in range(protocol.NUM_SERVOS)
+        ]
         self._diag_pub.publish(array)
+
+    def _servo_diagnostics(self, index: int, now: float) -> DiagnosticStatus:
+        """One servo's status: OK when present and normal, WARN from 60 C or with a status bit
+        set, ERROR when missing or from 70 C, STALE without recent SERVO_STATE."""
+        diag = DiagnosticStatus()
+        diag.name = servo_name(index)
+        diag.hardware_id = f"servo bus ID {index + 1}"
+        servo = self._servos[index]
+        if servo is None or now - self._servo_times[index] > SERVO_STALE_S:
+            diag.level = DiagnosticStatus.STALE
+            diag.message = "no SERVO_STATE from the Teensy"
+            return diag
+        present, position, speed, load, current, voltage, temperature, status = servo
+        if not present:
+            diag.level = DiagnosticStatus.ERROR
+            diag.message = "missing"
+            diag.values = [KeyValue(key="present", value="false")]
+            return diag
+
+        status_bits = protocol.decode_servo_status(status)
+        if temperature >= SERVO_ERROR_TEMP_C:
+            diag.level, diag.message = DiagnosticStatus.ERROR, f"temperature {temperature} C"
+        elif temperature >= SERVO_WARN_TEMP_C:
+            diag.level, diag.message = DiagnosticStatus.WARN, f"temperature {temperature} C"
+        elif status:
+            diag.level, diag.message = DiagnosticStatus.WARN, f"status: {status_bits}"
+        else:
+            diag.level, diag.message = DiagnosticStatus.OK, "ok"
+        position_deg = position * 360.0 / protocol.SERVO_COUNTS_PER_REV
+        diag.values = [
+            KeyValue(key="present", value="true"),
+            KeyValue(key="position_raw", value=str(position)),
+            # Raw: no zero offset or direction calibration yet.
+            KeyValue(key="position_deg", value=f"{position_deg:.1f}"),
+            KeyValue(key="speed_raw", value=str(speed)),
+            KeyValue(
+                key="load_percent", value=f"{load * protocol.SERVO_LOAD_PERCENT_PER_COUNT:.1f}"
+            ),
+            KeyValue(
+                key="current_ma", value=f"{current * protocol.SERVO_MILLIAMPS_PER_COUNT:.0f}"
+            ),
+            KeyValue(key="current_raw", value=str(current)),
+            KeyValue(key="voltage_v", value=f"{voltage * protocol.SERVO_VOLTS_PER_COUNT:.1f}"),
+            KeyValue(key="temperature_c", value=str(temperature)),
+            KeyValue(key="status", value=f"0x{status:02X}"),
+            KeyValue(key="status_bits", value=status_bits),
+        ]
+        return diag
 
     # ------------------------------------------------------------------------------------------
     # Shutdown
