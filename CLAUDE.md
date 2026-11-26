@@ -19,14 +19,17 @@ Home Guardian is a custom 8-DOF quadruped robot for autonomous indoor patrol.
   `ros2_ws/src/hg_teensy_bridge/hg_teensy_bridge/protocol.py`, used by the bridge node and
   `tools/test_link.py`. USB serial for now; hardware UART deferred
   (`docs/decisions/0001-usb-serial-link.md`).
-- Implemented message types: HEARTBEAT, MODE, CLEAR_FAULT (Pi → Teensy), STATUS and JOINT_STATE
-  (Teensy → Pi). All other IDs are reserved without a payload definition.
+- Implemented message types: HEARTBEAT, MODE, CLEAR_FAULT (Pi → Teensy), STATUS, JOINT_STATE and
+  SERVO_STATE (Teensy → Pi). All other IDs are reserved without a payload definition.
 - Firmware safety logic: posture mode state machine and latching heartbeat watchdog in
   `firmware/src/posture.h` (plain C++, host-tested). See
   `docs/decisions/0002-heartbeat-loss-latches.md`.
 - Kinematics (high risk, host-tested): leg IK/FK and reference poses in
   `firmware/src/kinematics.h`; conventions, poses and the URDF mapping in `docs/kinematics.md`.
   Keep `hg_description` consistent with it.
+- Servo bus (high risk): Feetech STS3250 servos, IDs 1-8, on Teensy `Serial1` half-duplex
+  (`firmware/src/servo_*.h`, `docs/servo-bus.md`). Read-only so far: the firmware only sends PING
+  and READ, and reports telemetry in SERVO_STATE.
 - **The repository is public.**
 
 ## Build and test
@@ -83,6 +86,11 @@ CI runs on every push and pull request: `firmware.yml` (host tests, `pio run`) a
   destroy the Pi.
 - **Do not upload firmware to the Teensy without asking the owner first.**
 - Ask before running `sudo` or installing system packages on the Pi.
+- **The firmware must not move a servo yet.** It never enables torque and never writes a goal
+  position. `ServoBus` refuses WRITE and SYNC WRITE unless `set_writes_enabled(true)` is called;
+  do not call it, or add any servo write, without the owner's explicit go-ahead.
+- The servo bus must never stall the 200 Hz control loop: no bus I/O in the timer interrupt, at
+  most one transaction per control tick, no blocking calls (`flush()`, waiting for a reply).
 - Only one program can use `/dev/ttyACM0` at a time. Keep ModemManager disabled, because it
   probes new serial devices.
 

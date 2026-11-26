@@ -7,7 +7,8 @@
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 > **Status: early development.** The real-time firmware, the Pi–Teensy link and the first ROS 2
-> packages are in place. Servos, sensors and autonomy are not integrated yet.
+> packages are in place. Servo telemetry is read, but the servos are not driven yet. Sensors
+> and autonomy are not integrated.
 
 ## Overview
 
@@ -23,6 +24,7 @@ real-time control loop and the safety logic.
 | Main computer | Raspberry Pi 5 (8 GB), NVMe SSD, Ubuntu Server 24.04, ROS 2 Jazzy |
 | Real-time controller | Teensy 4.1, bare-metal firmware (PlatformIO) |
 | Legs | 4 legs with 2 pitch joints each (hip, knee); femur 108 mm, tibia 130 mm |
+| Servos | 8 Feetech STS3250 bus servos on one half-duplex serial line (1 Mbps) |
 | Frame | Derived from the open-source SpotMicro design |
 
 ## Architecture
@@ -36,7 +38,7 @@ flowchart LR
     fw["Posture modes, kinematics, heartbeat watchdog"]
   end
   bridge <-->|"USB serial, framed protocol with CRC"| fw
-  fw --> joints["8 joint servos (planned)"]
+  fw <-->|"Half-duplex servo bus"| joints["8 STS3250 servos (telemetry only for now)"]
 ```
 
 The Pi sends commands and a 20 Hz heartbeat. The Teensy reports status and joint states, and falls
@@ -85,6 +87,7 @@ firmware/test_host/run_tests.sh
 
 - [Serial protocol, posture modes and faults](docs/protocol.md)
 - [Kinematics, reference poses and joint conventions](docs/kinematics.md)
+- [Servo bus: wiring, registers, timing and telemetry](docs/servo-bus.md)
 - [ROS 2 bridge: topics, services and parameters](ros2_ws/src/hg_teensy_bridge/README.md)
 - [Thermal camera: driver, person and fire detection](ros2_ws/src/hg_perception/README.md)
 - [Raspberry Pi setup](docs/setup/raspberry-pi.md)
@@ -96,7 +99,8 @@ firmware/test_host/run_tests.sh
 - [x] Posture modes (lie, sit, stand) with a latching heartbeat watchdog
 - [x] Leg kinematics and smooth joint-level posture transitions
 - [x] ROS 2 bridge, robot model (URDF) and CI builds
-- [ ] Servo integration and calibration
+- [x] Servo bus: presence and telemetry of the STS3250 servos (read-only)
+- [ ] Servo calibration and motion
 - [ ] Walking gait
 - [ ] IMU, foot contact and battery sensing
 - [ ] Mapping, localization and navigation
