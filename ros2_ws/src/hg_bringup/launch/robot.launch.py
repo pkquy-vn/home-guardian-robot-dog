@@ -5,7 +5,8 @@ camera (thermal_node and thermal_detector).
 Example:
     ros2 launch hg_bringup robot.launch.py port:=/dev/ttyACM0
 
-The bridge's launch arguments (port, baud, heartbeat_rate_hz, status_timeout_s) pass through.
+The bridge's launch arguments (port, baud, heartbeat_rate_hz, status_timeout_s,
+calibration_file) pass through.
 """
 
 import os

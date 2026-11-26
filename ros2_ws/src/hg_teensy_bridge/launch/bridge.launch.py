@@ -17,6 +17,12 @@ ARGUMENTS = [
     ("baud", "115200", int, "Baud rate (ignored by USB serial)"),
     ("heartbeat_rate_hz", "20.0", float, "HEARTBEAT send rate"),
     ("status_timeout_s", "0.5", float, "Link is 'connected' while STATUS arrived within this time"),
+    (
+        "calibration_file",
+        "~/.config/home_guardian/servo_calibration.yaml",
+        str,
+        "The Pi's copy of the joint calibration (keep it outside the repository)",
+    ),
 ]
 
 

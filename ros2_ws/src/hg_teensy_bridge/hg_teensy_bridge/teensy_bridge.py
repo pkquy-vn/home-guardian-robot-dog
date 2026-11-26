@@ -4,13 +4,20 @@
 Implements what the firmware supports today:
   - sends HEARTBEAT at heartbeat_rate_hz with an incrementing uint32 sequence;
   - sends MODE for each /teensy/cmd_mode message and CLEAR_FAULT for each /teensy/clear_fault
-    service call (the Teensy decides whether to accept them; there is no acknowledgement);
+    service call;
+  - sends CALIBRATION, JOINT_TARGET and SPEED_LIMIT for /teensy/servo_command messages (the
+    `servo` command-line tool publishes them);
+  - the Teensy decides whether to accept a command and answers with an ACK: every answer is
+    logged and published as text on /teensy/command_result;
   - parses STATUS and publishes /teensy/mode, /teensy/faults, /teensy/connected and
     /diagnostics;
   - parses JOINT_STATE and publishes /joint_states (sensor_msgs/JointState, radians), with the
-    joint names of the hg_description URDF;
-  - parses SERVO_STATE (bus servo telemetry) and adds one DiagnosticStatus per servo to
-    /diagnostics; logs when a servo appears or goes missing.
+    joint names of the hg_description URDF. The angles are measured for joints whose servo is
+    present and calibrated;
+  - parses SERVO_STATE and JOINT_STATUS and adds one DiagnosticStatus per servo to /diagnostics;
+    logs when a servo appears or goes missing, and the cause of every servo fault (FAULT);
+  - keeps a copy of the joint calibration in a YAML file outside the repository. The Teensy's
+    EEPROM is the source of truth: the copy follows it, and can be sent back (RESTORE).
 
 Safety: the heartbeat tells the Teensy that the Pi-side software is alive; the firmware raises
 HEARTBEAT_LOST after 500 ms without one. The heartbeat is therefore sent from a timer on this
@@ -32,11 +39,13 @@ from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Bool, UInt8, UInt16
+from std_msgs.msg import Bool, String, UInt8, UInt16
 from std_srvs.srv import Trigger
 
 import serial
+import yaml
 
+from hg_msgs.msg import ServoCommand
 from hg_teensy_bridge import protocol
 
 READ_PERIOD_S = 0.01  # Serial poll period (non-blocking reads).
@@ -48,6 +57,13 @@ MAX_READ_BYTES = 4096  # Upper bound on bytes read per poll.
 SERVO_STALE_S = 1.0  # SERVO_STATE (10 Hz per servo) older than this is reported as stale.
 SERVO_WARN_TEMP_C = 60  # Servo diagnostics: WARN at or above this temperature ...
 SERVO_ERROR_TEMP_C = 70  # ... and ERROR at or above this one.
+QUEUE_PERIOD_S = 0.05  # Queued frames (RESTORE) are sent one per period.
+DEFAULT_CALIBRATION_FILE = "~/.config/home_guardian/servo_calibration.yaml"
+CALIBRATION_FILE_HEADER = (
+    "# Home Guardian joint calibration: the Pi's copy, written by teensy_bridge.\n"
+    "# The Teensy's EEPROM is the source of truth. Send this copy back to the Teensy with:\n"
+    "#   ros2 run hg_teensy_bridge servo restore\n"
+)
 
 # URDF joint names (hg_description) in JOINT_STATE order: FL hip, FL knee, FR hip, ... RR knee.
 # The URDF joint values equal the firmware hip and knee angles (docs/kinematics.md).
@@ -61,6 +77,51 @@ def servo_name(index: int) -> str:
     return f"servo {index + 1} {protocol.JOINT_ORDER[index]}"
 
 
+def describe_fault(fault: int, joint: int, value: int) -> str:
+    """Text for one FAULT message, for example "SERVO_OVERCURRENT: FL knee, 3900 mA"."""
+    name = protocol.decode_fault_bits(fault)
+    where = protocol.joint_label(joint)
+    if fault in (protocol.FAULT_SERVO_HOT, protocol.FAULT_SERVO_OVERHEAT):
+        return f"{name}: {where}, {value} C"
+    if fault == protocol.FAULT_SERVO_OVERCURRENT:
+        return f"{name}: {where}, {value} mA"
+    if fault == protocol.FAULT_SERVO_TORQUE_LOST:
+        detail = "lost torque while driven" if value else "did not take torque within 1 s"
+        return f"{name}: {where}, {detail}"
+    return f"{name}: {where}"
+
+
+def load_calibration_file(path: str) -> dict[str, dict[str, int]]:
+    """Reads the saved calibration copy: {joint key: {"reference": counts, "direction": +-1}}.
+    Entries that are not valid are ignored. Raises OSError or yaml.YAMLError."""
+    with open(path, encoding="utf-8") as stream:
+        content = yaml.safe_load(stream)
+    saved = {}
+    joints = content.get("joints") if isinstance(content, dict) else None
+    for key, entry in (joints or {}).items():
+        if key not in protocol.JOINT_KEYS or not isinstance(entry, dict):
+            continue
+        reference, direction = entry.get("reference"), entry.get("direction")
+        if (
+            type(reference) is int
+            and 0 <= reference <= protocol.SERVO_COUNTS_PER_REV - 1
+            and direction in (1, -1)
+        ):
+            saved[key] = {"reference": reference, "direction": direction}
+    return saved
+
+
+def write_calibration_file(path: str, saved: dict[str, dict[str, int]]) -> None:
+    """Writes the calibration copy; replaces the file in one step. Raises OSError."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    ordered = {key: saved[key] for key in protocol.JOINT_KEYS if key in saved}
+    text = CALIBRATION_FILE_HEADER + yaml.safe_dump({"joints": ordered}, sort_keys=False)
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as stream:
+        stream.write(text)
+    os.replace(temporary, path)
+
+
 class TeensyBridge(Node):
     def __init__(self) -> None:
         super().__init__("teensy_bridge")
@@ -69,6 +130,10 @@ class TeensyBridge(Node):
         self._baud: int = self.declare_parameter("baud", 115200).value
         heartbeat_rate_hz: float = self.declare_parameter("heartbeat_rate_hz", 20.0).value
         self._status_timeout_s: float = self.declare_parameter("status_timeout_s", 0.5).value
+        calibration_file: str = self.declare_parameter(
+            "calibration_file", DEFAULT_CALIBRATION_FILE
+        ).value
+        self._calibration_file = os.path.expanduser(calibration_file) if calibration_file else ""
         if heartbeat_rate_hz <= 0.0:
             raise ValueError(f"heartbeat_rate_hz must be > 0, got {heartbeat_rate_hz}")
         if self._status_timeout_s <= 0.0:
@@ -84,6 +149,10 @@ class TeensyBridge(Node):
         )
         self._clear_fault_srv = self.create_service(
             Trigger, "/teensy/clear_fault", self._on_clear_fault
+        )
+        self._result_pub = self.create_publisher(String, "/teensy/command_result", 10)
+        self._servo_command_sub = self.create_subscription(
+            ServoCommand, "/teensy/servo_command", self._on_servo_command, 10
         )
 
         self._serial: Optional[serial.Serial] = None
@@ -109,6 +178,20 @@ class TeensyBridge(Node):
         self._servo_times = [0.0] * protocol.NUM_SERVOS
         self._servo_presence: Optional[list[bool]] = None  # As last logged.
 
+        # Latest JOINT_STATUS: speed limit (deg/s) and per joint (flags, block, reference,
+        # target_cdeg); latest JOINT_STATE angles (0.01 deg); causes of the latched servo faults.
+        self._speed_limit_deg_s: Optional[float] = None
+        self._joint_status: Optional[list[tuple[int, int, int, int]]] = None
+        self._joint_positions_cdeg: Optional[list[int]] = None
+        self._fault_causes: dict[int, str] = {}
+
+        # The Pi's copy of the joint calibration, and frames waiting to be sent (RESTORE).
+        self._saved_calibration: dict[str, dict[str, int]] = {}
+        self._calibration_file_failed = False
+        self._restore_hint_given = False
+        self._tx_queue: list[tuple[str, bytes]] = []
+        self._load_saved_calibration()
+
         # All timers use the node's default callback group (mutually exclusive) on the executor
         # that spins this node. Do not move the heartbeat to its own thread or callback group.
         self._heartbeat_timer = self.create_timer(1.0 / heartbeat_rate_hz, self._send_heartbeat)
@@ -118,11 +201,13 @@ class TeensyBridge(Node):
             self.create_timer(RECONNECT_PERIOD_S, self._ensure_port),
             self.create_timer(CONNECTED_PERIOD_S, self._publish_connected),
             self.create_timer(DIAGNOSTICS_PERIOD_S, self._publish_diagnostics),
+            self.create_timer(QUEUE_PERIOD_S, self._send_queued),
         ]
 
         self.get_logger().info(
             f"port={self._port_name} baud={self._baud} heartbeat={heartbeat_rate_hz:g} Hz "
-            f"status_timeout={self._status_timeout_s:g} s"
+            f"status_timeout={self._status_timeout_s:g} s "
+            f"calibration_file={self._calibration_file or '(none)'}"
         )
         self._ensure_port()
         self._publish_connected()
@@ -176,6 +261,12 @@ class TeensyBridge(Node):
         # Forget the servo states: after a reconnect the presence summary is logged again.
         self._servos = [None] * protocol.NUM_SERVOS
         self._servo_presence = None
+        self._joint_status = None
+        self._joint_positions_cdeg = None
+        self._speed_limit_deg_s = None
+        self._fault_causes = {}
+        self._restore_hint_given = False
+        self._tx_queue = []
         if not self._unavailable_reported:
             self.get_logger().warning(
                 f"lost {self._port_name}: {reason}; retrying every {RECONNECT_PERIOD_S:g} s"
@@ -214,31 +305,169 @@ class TeensyBridge(Node):
     # Commands
     # ------------------------------------------------------------------------------------------
 
+    def _report(self, ok: bool, text: str) -> None:
+        """Logs the outcome of a command and publishes it on /teensy/command_result as
+        "OK: ..." or "FAILED: ..."."""
+        if ok:
+            self.get_logger().info(text)
+        else:
+            self.get_logger().warning(text)
+        self._result_pub.publish(String(data=("OK: " if ok else "FAILED: ") + text))
+
+    def _send_command(self, label: str, msg_type: int, payload: bytes = b"") -> bool:
+        """Sends one command frame. The Teensy's ACK is reported when it arrives."""
+        if self._write_frame(protocol.encode_frame(msg_type, payload)):
+            self.get_logger().info(f"sent {label}")
+            return True
+        self._report(False, f"{label} not sent: serial port unavailable")
+        return False
+
     def _on_cmd_mode(self, msg: UInt8) -> None:
         mode = msg.data
         name = protocol.mode_name(mode)
         if mode not in protocol.MODE_NAMES:
             self.get_logger().warning(f"cmd_mode {name}: unknown mode; the Teensy will reject it")
-        if self._write_frame(protocol.encode_frame(protocol.MODE, protocol.pack_mode(mode))):
-            self.get_logger().info(f"sent MODE {name}")
-        else:
-            self.get_logger().warning(f"MODE {name} not sent: serial port unavailable")
+        self._send_command(f"MODE {name}", protocol.MODE, protocol.pack_mode(mode))
 
     def _on_clear_fault(
         self, request: Trigger.Request, response: Trigger.Response
     ) -> Trigger.Response:
         del request  # Trigger requests are empty.
-        if self._write_frame(protocol.encode_frame(protocol.CLEAR_FAULT)):
+        if self._send_command("CLEAR_FAULT", protocol.CLEAR_FAULT):
             response.success = True
             response.message = (
-                "CLEAR_FAULT sent; the Teensy clears the latch only while heartbeats are healthy. "
-                "Check /teensy/faults."
+                "CLEAR_FAULT sent; the Teensy clears faults only while heartbeats are healthy. "
+                "Its answer is published on /teensy/command_result."
             )
         else:
             response.success = False
             response.message = "CLEAR_FAULT not sent: serial port unavailable"
-        self.get_logger().info(response.message)
         return response
+
+    def _on_servo_command(self, msg: ServoCommand) -> None:
+        command, joint, value = msg.command, msg.joint, float(msg.value)
+        if command == ServoCommand.SET_SPEED_LIMIT:
+            if not math.isfinite(value) or value <= 0.0:
+                self._report(False, f"SPEED_LIMIT: invalid speed {value}")
+                return
+            speed = min(int(round(value * 10.0)), 0xFFFF)
+            payload = protocol.pack_speed_limit(speed)
+            self._send_command(f"SPEED_LIMIT {value:g} deg/s", protocol.SPEED_LIMIT, payload)
+            return
+        if command == ServoCommand.RESTORE:
+            self._queue_restore(joint)
+            return
+        if joint >= protocol.NUM_JOINTS:
+            self._report(False, f"servo command {command}: unknown joint {joint}")
+            return
+        label = protocol.JOINT_ORDER[joint]
+
+        if command == ServoCommand.CALIBRATE:
+            payload = protocol.pack_calibration(protocol.CAL_CAPTURE, joint)
+            self._send_command(f"CALIBRATION capture {label}", protocol.CALIBRATION, payload)
+        elif command == ServoCommand.FLIP_DIRECTION:
+            if self._joint_status is None:
+                self._report(False, f"flip {label}: no JOINT_STATUS from the Teensy yet")
+                return
+            negative = bool(self._joint_status[joint][0] & protocol.JOINT_DIRECTION_NEGATIVE)
+            direction = 1 if negative else -1
+            payload = protocol.pack_calibration(protocol.CAL_SET_DIRECTION, joint, direction)
+            self._send_command(
+                f"CALIBRATION direction {label} {direction:+d}", protocol.CALIBRATION, payload
+            )
+        elif command == ServoCommand.SET_ANGLE:
+            if not math.isfinite(value) or abs(value) > 327.0:
+                self._report(False, f"JOINT_TARGET {label}: invalid angle {value}")
+                return
+            payload = protocol.pack_joint_target(joint, int(round(value * 100.0)))
+            name = f"JOINT_TARGET {label} {value:g} deg"
+            self._send_command(name, protocol.JOINT_TARGET, payload)
+        else:
+            self._report(False, f"unknown servo command {command}")
+
+    def _queue_restore(self, joint: int) -> None:
+        """Queues one CALIBRATION restore per saved joint (all, or the one given)."""
+        if joint == ServoCommand.ALL_JOINTS:
+            keys = [key for key in protocol.JOINT_KEYS if key in self._saved_calibration]
+        elif joint < protocol.NUM_JOINTS:
+            keys = [k for k in (protocol.JOINT_KEYS[joint],) if k in self._saved_calibration]
+        else:
+            keys = []
+        if not keys:
+            self._report(
+                False, f"restore: no saved calibration for that in {self._calibration_file}"
+            )
+            return
+        for key in keys:
+            index = protocol.JOINT_KEYS.index(key)
+            entry = self._saved_calibration[key]
+            payload = protocol.pack_calibration(
+                protocol.CAL_RESTORE, index, entry["direction"], entry["reference"]
+            )
+            label = (
+                f"CALIBRATION restore {protocol.JOINT_ORDER[index]} "
+                f"(reference {entry['reference']}, direction {entry['direction']:+d})"
+            )
+            self._tx_queue.append((label, protocol.encode_frame(protocol.CALIBRATION, payload)))
+
+    def _send_queued(self) -> None:
+        """Sends one queued frame per call, so the Teensy stores them one at a time."""
+        if not self._tx_queue or self._stopping:
+            return
+        label, frame = self._tx_queue.pop(0)
+        if self._write_frame(frame):
+            self.get_logger().info(f"sent {label}")
+        else:
+            self._tx_queue = []
+            self._report(False, f"{label} not sent: serial port unavailable")
+
+    # ------------------------------------------------------------------------------------------
+    # Calibration copy on the Pi
+    # ------------------------------------------------------------------------------------------
+
+    def _load_saved_calibration(self) -> None:
+        if not self._calibration_file or not os.path.exists(self._calibration_file):
+            return
+        try:
+            self._saved_calibration = load_calibration_file(self._calibration_file)
+        except (OSError, yaml.YAMLError) as exc:
+            self.get_logger().warning(f"cannot read {self._calibration_file}: {exc}")
+            return
+        self.get_logger().info(
+            f"saved calibration copy: {', '.join(self._saved_calibration) or 'empty'}"
+        )
+
+    def _update_saved_calibration(self, joints: list[tuple[int, int, int, int]]) -> None:
+        """Makes the copy follow the Teensy. A joint the Teensy reports as not calibrated keeps
+        its saved entry, so a wiped Teensy never erases the copy."""
+        if not self._calibration_file:
+            return
+        merged = dict(self._saved_calibration)
+        only_saved = []
+        for key, (flags, _block, reference, _target) in zip(protocol.JOINT_KEYS, joints):
+            if flags & protocol.JOINT_CALIBRATED:
+                direction = -1 if flags & protocol.JOINT_DIRECTION_NEGATIVE else 1
+                merged[key] = {"reference": reference, "direction": direction}
+            elif key in merged:
+                only_saved.append(key)
+        if only_saved and not self._restore_hint_given:
+            self._restore_hint_given = True
+            self.get_logger().warning(
+                f"the Teensy has no calibration for {', '.join(only_saved)} but a saved copy "
+                "exists; send it with: ros2 run hg_teensy_bridge servo restore"
+            )
+        if merged == self._saved_calibration:
+            return
+        self._saved_calibration = merged
+        try:
+            write_calibration_file(self._calibration_file, merged)
+        except OSError as exc:
+            if not self._calibration_file_failed:
+                self.get_logger().warning(f"cannot write {self._calibration_file}: {exc}")
+            self._calibration_file_failed = True
+            return
+        self._calibration_file_failed = False
+        self.get_logger().info(f"calibration copy saved to {self._calibration_file}")
 
     # ------------------------------------------------------------------------------------------
     # STATUS
@@ -260,6 +489,12 @@ class TeensyBridge(Node):
                     self._handle_joint_state(payload)
                 elif msg_type == protocol.SERVO_STATE:
                     self._handle_servo_state(payload)
+                elif msg_type == protocol.JOINT_STATUS:
+                    self._handle_joint_status(payload)
+                elif msg_type == protocol.ACK:
+                    self._handle_ack(payload)
+                elif msg_type == protocol.FAULT:
+                    self._handle_fault(payload)
         self._update_connected()
 
     def _handle_joint_state(self, payload: bytes) -> None:
@@ -269,10 +504,60 @@ class TeensyBridge(Node):
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.name = JOINT_NAMES
-        # Position in 0.01 deg -> rad. Current and temperature (0 until servos exist) are not
-        # published: their units are not defined yet.
-        msg.position = [math.radians(position_cdeg / 100.0) for position_cdeg, _, _ in joints]
+        # Position in 0.01 deg -> rad: measured where the servo is present and calibrated,
+        # otherwise the commanded posture angle. Current and temperature are in /diagnostics.
+        self._joint_positions_cdeg = [position_cdeg for position_cdeg, _, _ in joints]
+        msg.position = [math.radians(cdeg / 100.0) for cdeg in self._joint_positions_cdeg]
         self._joint_state_pub.publish(msg)
+
+    def _handle_joint_status(self, payload: bytes) -> None:
+        decoded = protocol.unpack_joint_status(payload)
+        if decoded is None:
+            return
+        speed_limit, joints = decoded
+        self._speed_limit_deg_s = speed_limit / 10.0
+        self._joint_status = joints
+        self._update_saved_calibration(joints)
+
+    def _handle_ack(self, payload: bytes) -> None:
+        """Reports the Teensy's answer to a command."""
+        decoded = protocol.unpack_ack(payload)
+        if decoded is None:
+            return
+        command, result, joint, value = decoded
+        text = protocol.COMMAND_NAMES.get(command, f"command 0x{command:02X}")
+        if command == protocol.MODE:
+            text += f" {protocol.mode_name(value)}"
+        elif joint != protocol.NO_JOINT:
+            text += f" {protocol.joint_label(joint)}"
+        applied = result in (protocol.ACK_OK, protocol.ACK_NO_CHANGE)
+        if command == protocol.CALIBRATION and result == protocol.ACK_RANGE_ERROR:
+            text += (
+                f": stored (reference {value}), but the joint range does not fit the servo range "
+                "with this direction, so the joint will not get torque. Flip the direction or "
+                "remount the horn."
+            )
+            self._report(False, text)
+            return
+        text += f": {protocol.ack_result_name(result)}"
+        if command == protocol.CALIBRATION and applied:
+            text += f" (reference {value})"
+        elif command == protocol.JOINT_TARGET and applied:
+            text += f" (target {value / 100.0:.1f} deg)"
+        elif command == protocol.SPEED_LIMIT and applied:
+            text += f" ({value / 10.0:g} deg/s)"
+        self._report(applied, text)
+
+    def _handle_fault(self, payload: bytes) -> None:
+        """Logs the cause of a servo fault once, when it is first reported."""
+        decoded = protocol.unpack_fault(payload)
+        if decoded is None:
+            return
+        fault, joint, value = decoded
+        text = describe_fault(fault, joint, value)
+        if self._fault_causes.get(fault) != text:
+            self._fault_causes[fault] = text
+            self.get_logger().error(f"servo fault: {text}")
 
     def _handle_servo_state(self, payload: bytes) -> None:
         decoded = protocol.unpack_servo_state(payload)
@@ -314,6 +599,8 @@ class TeensyBridge(Node):
         self._status_in_window += 1
         self._mode = mode
         self._fault_bits = fault_bits
+        # Forget the cause of a fault that has been cleared, so a new one is logged again.
+        self._fault_causes = {f: t for f, t in self._fault_causes.items() if f & fault_bits}
         self._mode_pub.publish(UInt8(data=mode))
         self._faults_pub.publish(UInt16(data=fault_bits))
 
@@ -384,6 +671,11 @@ class TeensyBridge(Node):
             ),
             KeyValue(key="heartbeats_sent", value=str(self._heartbeats_sent)),
             KeyValue(key="heartbeats_dropped", value=str(self._heartbeats_dropped)),
+            KeyValue(
+                key="speed_limit_deg_s",
+                value="-" if self._speed_limit_deg_s is None else f"{self._speed_limit_deg_s:g}",
+            ),
+            KeyValue(key="fault_causes", value="; ".join(self._fault_causes.values()) or "none"),
         ]
         array = DiagnosticArray()
         array.header.stamp = self.get_clock().now().to_msg()
@@ -391,6 +683,33 @@ class TeensyBridge(Node):
             self._servo_diagnostics(index, now) for index in range(protocol.NUM_SERVOS)
         ]
         self._diag_pub.publish(array)
+
+    def _joint_values(self, index: int) -> list[KeyValue]:
+        """Calibration and motion state of one joint, from JOINT_STATUS and JOINT_STATE."""
+        if self._joint_status is None:
+            return []
+        flags, block, reference, target_cdeg = self._joint_status[index]
+        calibrated = bool(flags & protocol.JOINT_CALIBRATED)
+        measured = "-"
+        if flags & protocol.JOINT_MEASURED and self._joint_positions_cdeg is not None:
+            measured = f"{self._joint_positions_cdeg[index] / 100.0:.1f}"
+        return [
+            KeyValue(key="calibrated", value="yes" if calibrated else "no"),
+            KeyValue(
+                key="direction", value="-1" if flags & protocol.JOINT_DIRECTION_NEGATIVE else "+1"
+            ),
+            KeyValue(key="reference_raw", value=str(reference) if calibrated else "-"),
+            KeyValue(key="torque", value="on" if flags & protocol.JOINT_TORQUE_ON else "off"),
+            KeyValue(key="driven", value="yes" if flags & protocol.JOINT_DRIVEN else "no"),
+            KeyValue(
+                key="test_target", value="yes" if flags & protocol.JOINT_TEST_TARGET else "no"
+            ),
+            KeyValue(key="target_deg", value=f"{target_cdeg / 100.0:.1f}"),
+            KeyValue(key="measured_deg", value=measured),
+            KeyValue(
+                key="drive_block", value=protocol.JOINT_BLOCK_NAMES.get(block, f"code {block}")
+            ),
+        ]
 
     def _servo_diagnostics(self, index: int, now: float) -> DiagnosticStatus:
         """One servo's status: OK when present and normal, WARN from 60 C or with a status bit
@@ -407,7 +726,7 @@ class TeensyBridge(Node):
         if not present:
             diag.level = DiagnosticStatus.ERROR
             diag.message = "missing"
-            diag.values = [KeyValue(key="present", value="false")]
+            diag.values = [KeyValue(key="present", value="false")] + self._joint_values(index)
             return diag
 
         status_bits = protocol.decode_servo_status(status)
@@ -423,7 +742,7 @@ class TeensyBridge(Node):
         diag.values = [
             KeyValue(key="present", value="true"),
             KeyValue(key="position_raw", value=str(position)),
-            # Raw: no zero offset or direction calibration yet.
+            # The servo's own angle. The joint angle is measured_deg, below.
             KeyValue(key="position_deg", value=f"{position_deg:.1f}"),
             KeyValue(key="speed_raw", value=str(speed)),
             KeyValue(
@@ -437,7 +756,7 @@ class TeensyBridge(Node):
             KeyValue(key="temperature_c", value=str(temperature)),
             KeyValue(key="status", value=f"0x{status:02X}"),
             KeyValue(key="status_bits", value=status_bits),
-        ]
+        ] + self._joint_values(index)
         return diag
 
     # ------------------------------------------------------------------------------------------

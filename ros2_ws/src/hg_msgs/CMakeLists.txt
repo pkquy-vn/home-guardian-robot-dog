@@ -9,6 +9,7 @@ find_package(sensor_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ThermalPerson.msg"
   "msg/ThermalDetections.msg"
+  "msg/ServoCommand.msg"
   DEPENDENCIES std_msgs sensor_msgs
 )
 

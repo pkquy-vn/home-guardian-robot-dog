@@ -3,7 +3,7 @@
 <package format="3">
   <name>hg_teensy_bridge</name>
   <version>0.1.0</version>
-  <description>Home Guardian Pi-Teensy serial bridge: HEARTBEAT, MODE and CLEAR_FAULT out; STATUS in.</description>
+  <description>Home Guardian Pi-Teensy serial bridge, and the servo calibration and test tool.</description>
   <maintainer email="215331687+pkquy-vn@users.noreply.github.com">Wynn Pham</maintainer>
   <license>Apache-2.0</license>
 
@@ -12,9 +12,11 @@
   <exec_depend>diagnostic_msgs</exec_depend>
   <exec_depend>std_srvs</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>hg_msgs</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>python3-serial</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
 
   <export>
     <build_type>ament_python</build_type>

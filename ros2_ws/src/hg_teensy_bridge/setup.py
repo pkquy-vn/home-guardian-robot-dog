@@ -16,11 +16,12 @@ setup(
     zip_safe=True,
     maintainer="Wynn Pham",
     maintainer_email="215331687+pkquy-vn@users.noreply.github.com",
-    description="Home Guardian Pi-Teensy bridge: HEARTBEAT, MODE, CLEAR_FAULT out; STATUS in.",
+    description="Home Guardian Pi-Teensy serial bridge, and the servo calibration and test tool.",
     license="Apache-2.0",
     entry_points={
         "console_scripts": [
             "teensy_bridge = hg_teensy_bridge.teensy_bridge:main",
+            "servo = hg_teensy_bridge.servo_cli:main",
         ],
     },
 )
