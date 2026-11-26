@@ -7,26 +7,35 @@
 //   - Posture mode state machine with heartbeat watchdog and heartbeat-loss response
 //     (posture.h; HEARTBEAT_LOST latches, see docs/decisions/0002-heartbeat-loss-latches.md).
 //   - Joint-level postures (kinematics.h, joint_motion.h): during a transition all eight joint
-//     angles are interpolated to the target pose with a minimum-jerk profile. No servos yet: the
-//     commanded angles are only reported.
+//     angles are interpolated to the target pose with a minimum-jerk profile. The commanded
+//     angles are only reported: they are NOT sent to the servos.
+//   - Servo bus (servo_manager.h): Feetech STS3250 servos, IDs 1..8, on Serial1 half-duplex.
+//     Read-only: presence (ping) and telemetry (read). The firmware never enables torque and
+//     never writes a goal position.
 //   - 200 Hz control tick: an IntervalTimer sets a flag, the work runs in loop().
 //   - STATUS out at 10 Hz (uint8 mode, uint8 gait phase, uint16 fault bits).
 //   - JOINT_STATE out at 50 Hz (commanded angles in 0.01 deg; current and temperature 0).
+//   - SERVO_STATE out at 10 Hz per group of four servos (IDs 1-4 and 5-8, alternating).
 //   - On-board LED: 1 Hz blink while the link is OK and no fault is set, 5 Hz otherwise.
 // All other message types are parsed and ignored.
 //
-// The loop never blocks: no delay(), no waiting for the host, and STATUS is skipped rather than
-// queued when the link cannot take it.
+// The loop never blocks: no delay(), no waiting for the host or for a servo, and outgoing
+// messages are skipped rather than queued when the link cannot take them.
 
 #include <Arduino.h>
 
 #include "joint_motion.h"
 #include "posture.h"
 #include "protocol.h"
+#include "servo_manager.h"
 
 // Serial port used for the Pi link. `Serial` is USB; change to `Serial7` (pins 28/29) for the
 // hardware UART. See docs/decisions/0001-usb-serial-link.md.
 #define LINK Serial
+
+// Serial port of the servo bus: half-duplex, data on the TX pin only (Serial1: pin 1), with a
+// 1 kOhm pull-up to 3.3 V.
+#define SERVO_SERIAL Serial1
 
 namespace {
 
@@ -34,6 +43,8 @@ constexpr uint32_t kLinkBaud = 115200;            // Ignored by USB serial; used
 constexpr uint32_t kControlPeriodUs = 5000;       // 200 Hz control tick.
 constexpr uint32_t kStatusPeriodMs = 100;         // 10 Hz
 constexpr uint32_t kJointStatePeriodMs = 20;      // 50 Hz
+constexpr uint32_t kServoBaud = 1000000;          // Feetech STS default.
+constexpr uint32_t kServoStatePeriodMs = 50;      // Two groups alternate: 10 Hz per group.
 constexpr uint32_t kLedTogglePeriodOkMs = 500;    // 1 Hz blink
 constexpr uint32_t kLedTogglePeriodLostMs = 100;  // 5 Hz blink
 constexpr int kMaxBytesPerLoop = 256;             // Bound the time spent reading per loop.
@@ -42,6 +53,10 @@ hg::FrameParser parser;
 hg::PostureStateMachine posture;
 hg::JointMotion joint_motion;
 uint32_t last_joint_state_ms = 0;
+
+hg::ServoManager servos;
+uint32_t last_servo_state_ms = 0;
+uint8_t next_servo_state_group = 0;
 
 IntervalTimer control_timer;
 volatile bool control_tick_due = false;
@@ -108,6 +123,9 @@ void run_control_tick() {
     const uint32_t now = millis();
     posture.tick(now);
     joint_motion.update(posture, now);
+    // Starts at most one servo bus transaction (ping or read) and returns at once. The
+    // commanded joint angles are not sent to the servos.
+    servos.on_control_tick(now, micros());
   }
 }
 
@@ -161,6 +179,27 @@ void send_joint_state(uint32_t now) {
   LINK.write(frame, n);
 }
 
+void send_servo_state(uint32_t now) {
+  if (now - last_servo_state_ms < kServoStatePeriodMs) return;
+  last_servo_state_ms = now;
+
+  // Servo IDs 1-4 and 5-8 alternate, so each group is sent at 10 Hz.
+  const size_t first_index = next_servo_state_group * hg::kServoStateGroupSize;
+  next_servo_state_group ^= 1;
+  hg::ServoStateEntry group[hg::kServoStateGroupSize];
+  for (size_t i = 0; i < hg::kServoStateGroupSize; ++i) group[i] = servos.servo(first_index + i);
+
+  uint8_t payload[hg::kServoStatePayloadSize];
+  hg::pack_servo_state(static_cast<uint8_t>(first_index + 1), group, payload);
+
+  uint8_t frame[hg::kMaxFrameSize];
+  const size_t n =
+      hg::encode_frame(hg::MsgType::kServoState, payload, sizeof(payload), frame, sizeof(frame));
+  if (n == 0) return;
+  if (LINK.availableForWrite() < static_cast<int>(n)) return;  // Skip rather than block.
+  LINK.write(frame, n);
+}
+
 void update_led(uint32_t now) {
   const uint32_t period = posture.fault_bits() != 0 ? kLedTogglePeriodLostMs : kLedTogglePeriodOkMs;
   if (now - last_led_toggle_ms < period) return;
@@ -176,14 +215,18 @@ void setup() {
   digitalWriteFast(LED_BUILTIN, LOW);
   LINK.begin(kLinkBaud);                       // Does not wait for the host to open the port.
   joint_motion.init(posture.reported_mode());  // Boot pose: LIE.
+  SERVO_SERIAL.begin(kServoBaud, SERIAL_HALF_DUPLEX);
+  servos.begin(SERVO_SERIAL, kServoBaud);
   control_timer_running = control_timer.begin(on_control_timer, kControlPeriodUs);
 }
 
 void loop() {
   read_link();
+  servos.poll(micros());  // Finishes the servo bus transaction in progress; never waits.
   run_control_tick();
   const uint32_t now = millis();
   send_status(now);
   send_joint_state(now);
+  send_servo_state(now);
   update_led(now);
 }
