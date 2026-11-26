@@ -50,7 +50,8 @@ A joint is driven only if all of this holds; `servo show` prints the reason othe
   starts at the measured angle.
 - **LIE** never gives torque. Driven joints move to the lie pose, hold for 0.3 s, then go limp.
 - **SIT, STAND, WALK** hold torque. WALK is the STAND pose for now.
-- **TORQUE_OFF** removes torque at once.
+- **TORQUE_OFF** removes torque at once. In this mode nothing gets torque: a joint test is
+  refused until LIE has been requested (LIE itself gives no torque).
 - A limp servo that reports torque on is told to turn it off, and torque off is sent to all IDs
   every 200 ms while no joint is driven.
 
@@ -109,6 +110,9 @@ Every command prints the Teensy's answer. Postures use the mode topic, `/teensy/
 3. Check the direction with a small move at low speed, for example `servo speed 20`, then
    `servo angle fl_knee 100` (the knee must open) or `servo angle fl_hip 10` (the femur must
    move forward).
-4. If a joint moves the wrong way: `servo off`, `servo flip <joint>`, and repeat step 3.
-   Do this before any posture: with a wrong sign, a posture mirrors the joint about its
-   reference pose and can run it into a stop.
+4. If a joint moves the wrong way: `servo off`, `servo flip <joint>`, request LIE (mode 0, to
+   leave TORQUE_OFF; the leg stays limp), and repeat step 3. Do this before any posture: with a
+   wrong sign, a posture mirrors the joint about its reference pose and can run it into a stop.
+
+The direction can also be checked without torque: with the joint limp, move it by hand in its
+positive direction and watch `measured` in `servo show` increase.

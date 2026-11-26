@@ -539,6 +539,10 @@ class TeensyBridge(Node):
             )
             self._report(False, text)
             return
+        if command == protocol.JOINT_TARGET and result == protocol.ACK_NOT_ALLOWED:
+            # The only mode that refuses a joint test.
+            self._report(False, text + ": refused: the mode is TORQUE_OFF, request LIE first")
+            return
         text += f": {protocol.ack_result_name(result)}"
         if command == protocol.CALIBRATION and applied:
             text += f" (reference {value})"
