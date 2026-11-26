@@ -37,8 +37,8 @@ constexpr size_t kMaxFrameSize = kHeaderSize + kMaxPayload + kCrcSize;
 constexpr uint16_t kCrcInit = 0xFFFF;
 constexpr uint16_t kCrcPoly = 0x1021;
 
-// Message type IDs. kHeartbeat, kMode, kClearFault, kJointState and kStatus have defined
-// payloads; the others are reserved IDs whose payloads will be specified when they are
+// Message type IDs. kHeartbeat, kMode, kClearFault, kJointState, kStatus and kServoState have
+// defined payloads; the others are reserved IDs whose payloads will be specified when they are
 // implemented.
 enum class MsgType : uint8_t {
   // Pi -> Teensy
@@ -58,6 +58,7 @@ enum class MsgType : uint8_t {
   kBattery = 0x15,     // BATTERY
   kStatus = 0x16,      // STATUS
   kFault = 0x17,       // FAULT
+  kServoState = 0x18,  // SERVO_STATE
 };
 
 // Posture modes: requested with MODE, reported in StatusPayload::mode.
@@ -354,6 +355,73 @@ inline bool unpack_joint_state(const uint8_t* payload, size_t len,
     joints[i].position_cdeg = static_cast<int16_t>(get_u16le(entry));
     joints[i].current = static_cast<int16_t>(get_u16le(entry + 2));
     joints[i].temperature = static_cast<int8_t>(entry[4]);
+  }
+  return true;
+}
+
+// SERVO_STATE (Teensy -> Pi): telemetry of the bus servos, IDs 1..8 (ID = JointIndex + 1).
+// Eight servos do not fit in one 64-byte payload, so each message carries a group of four:
+//   uint8 first servo ID of the group (1 or 5), then for IDs first .. first + 3:
+//   uint8 flags (bit 0 = present), int16 position, int16 speed, int16 load, int16 current,
+//   uint8 voltage, uint8 temperature, uint8 status.
+// Values are in servo units, with the servo's sign-magnitude words decoded to two's complement:
+// position in counts (4096 per turn, raw: no calibration), speed in counts per second, load in
+// 0.1 % (sign = direction), current in counts (about 6.5 mA each), voltage in 0.1 V, temperature
+// in deg C, status = the servo's status byte (0 = no fault). All fields are 0 when not present.
+constexpr size_t kNumServos = 8;
+constexpr size_t kServoStateGroupSize = 4;
+constexpr size_t kServoStateEntrySize = 12;
+constexpr size_t kServoStatePayloadSize = 1 + kServoStateGroupSize * kServoStateEntrySize;  // 49
+constexpr uint8_t kServoFlagPresent = 1u << 0;
+
+struct ServoStateEntry {
+  bool present = false;
+  int16_t position = 0;     // counts
+  int16_t speed = 0;        // counts per second
+  int16_t load = 0;         // 0.1 %
+  int16_t current = 0;      // counts
+  uint8_t voltage = 0;      // 0.1 V
+  uint8_t temperature = 0;  // deg C
+  uint8_t status = 0;
+};
+
+// True for the first servo ID of a group: 1 or 5.
+inline bool is_valid_servo_group(uint8_t first_id) {
+  return first_id >= 1 && first_id + kServoStateGroupSize - 1 <= kNumServos &&
+         (first_id - 1) % kServoStateGroupSize == 0;
+}
+
+inline void pack_servo_state(uint8_t first_id,
+                             const ServoStateEntry (&servos)[kServoStateGroupSize], uint8_t* out) {
+  out[0] = first_id;
+  for (size_t i = 0; i < kServoStateGroupSize; ++i) {
+    uint8_t* entry = out + 1 + i * kServoStateEntrySize;
+    entry[0] = servos[i].present ? kServoFlagPresent : 0;
+    put_u16le(entry + 1, static_cast<uint16_t>(servos[i].position));
+    put_u16le(entry + 3, static_cast<uint16_t>(servos[i].speed));
+    put_u16le(entry + 5, static_cast<uint16_t>(servos[i].load));
+    put_u16le(entry + 7, static_cast<uint16_t>(servos[i].current));
+    entry[9] = servos[i].voltage;
+    entry[10] = servos[i].temperature;
+    entry[11] = servos[i].status;
+  }
+}
+
+inline bool unpack_servo_state(const uint8_t* payload, size_t len, uint8_t* first_id,
+                               ServoStateEntry (&servos)[kServoStateGroupSize]) {
+  if (len != kServoStatePayloadSize || payload == nullptr || first_id == nullptr) return false;
+  if (!is_valid_servo_group(payload[0])) return false;
+  *first_id = payload[0];
+  for (size_t i = 0; i < kServoStateGroupSize; ++i) {
+    const uint8_t* entry = payload + 1 + i * kServoStateEntrySize;
+    servos[i].present = (entry[0] & kServoFlagPresent) != 0;
+    servos[i].position = static_cast<int16_t>(get_u16le(entry + 1));
+    servos[i].speed = static_cast<int16_t>(get_u16le(entry + 3));
+    servos[i].load = static_cast<int16_t>(get_u16le(entry + 5));
+    servos[i].current = static_cast<int16_t>(get_u16le(entry + 7));
+    servos[i].voltage = entry[9];
+    servos[i].temperature = entry[10];
+    servos[i].status = entry[11];
   }
   return true;
 }

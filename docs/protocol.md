@@ -44,6 +44,27 @@ resynchronizes on the next start byte.
 | BATTERY | `0x15` | Teensy → Pi | not defined yet | Reserved |
 | STATUS | `0x16` | Teensy → Pi | `uint8` mode, `uint8` gait phase, `uint16` fault bits | Implemented (gait phase is always 0 for now) |
 | FAULT | `0x17` | Teensy → Pi | not defined yet | Reserved |
+| SERVO_STATE | `0x18` | Teensy → Pi | `uint8` first servo ID (1 or 5), then 4 x (`uint8` flags, `int16` position, `int16` speed, `int16` load, `int16` current, `uint8` voltage, `uint8` temperature, `uint8` status) | Implemented |
+
+## SERVO_STATE
+
+Telemetry of the bus servos, IDs 1 to 8 (see [servo-bus.md](servo-bus.md)). Eight servos do not
+fit in one 64-byte payload, so each message carries a group of four: IDs 1-4 or 5-8. The two
+groups alternate, each at 10 Hz. Payload: 49 bytes.
+
+| Field | Type | Unit |
+| --- | --- | --- |
+| flags | `uint8` | bit 0 = present |
+| position | `int16` | counts, 4096 per turn. Raw: no calibration |
+| speed | `int16` | counts per second |
+| load | `int16` | 0.1 %, sign = direction |
+| current | `int16` | counts, about 6.5 mA each (to be checked against a meter) |
+| voltage | `uint8` | 0.1 V |
+| temperature | `uint8` | deg C |
+| status | `uint8` | the servo's status byte, 0 = no fault |
+
+The servo's sign-magnitude values are decoded to two's complement by the firmware. All fields are
+0 for a servo that is not present.
 
 ## Posture modes
 
@@ -60,7 +81,7 @@ the posture state machine in [`firmware/src/posture.h`](../firmware/src/posture.
 - **Rejected:** any other request that is illegal, arrives during a transition, or arrives while
   a fault bit is set. Rejections are counted on the Teensy.
 
-There are no servos yet: the commanded angles are only reported in JOINT_STATE.
+The commanded angles are only reported in JOINT_STATE: they are not sent to the servos yet.
 
 ## Faults and the heartbeat watchdog
 

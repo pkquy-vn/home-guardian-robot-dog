@@ -233,6 +233,34 @@ class PayloadTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             py.pack_joint_state(joints[:7])
 
+    def test_servo_state_payload(self):
+        servos = [
+            (True, 2048, 0, 0, 0, 121, 31, 0),
+            (True, -32767, -1200, -1000, -3, 255, 255, 0x3F),
+            (False, 0, 0, 0, 0, 0, 0, 0),
+            (True, 32767, 32767, 1000, 461, 74, 70, 0x01),
+        ]
+        for first_id in (1, 5):
+            payload = py.pack_servo_state(first_id, servos)
+            self.assertEqual(len(payload), 49)
+            self.assertEqual(len(payload), py.SERVO_STATE_PAYLOAD_SIZE)
+            args = [str(first_id)] + [str(int(v)) for servo in servos for v in servo]
+            self.assertEqual(cpp("pack-servo-state", *args), payload.hex())
+            self.assertEqual(cpp("unpack-servo-state", payload.hex()).split(), args)
+            self.assertEqual(py.unpack_servo_state(payload), (first_id, servos))
+            frame = py.encode_frame(py.SERVO_STATE, payload)
+            self.assertEqual(cpp_encode(py.SERVO_STATE, payload), frame)
+        self.assertEqual(py.SERVO_STATE, 0x18)
+        payload = py.pack_servo_state(1, servos)
+        # First entry on the wire: flags, then little-endian int16 fields, then three bytes.
+        self.assertEqual(payload[:13].hex(), "01" + "01" + "0008" + "0000" * 3 + "791f00")
+        bad_first_ids = (bytes([0]) + payload[1:], bytes([2]) + payload[1:])
+        for bad in (payload[:-1], payload + b"\x00", *bad_first_ids):
+            self.assertEqual(cpp("unpack-servo-state", bad.hex()), "invalid")
+            self.assertIsNone(py.unpack_servo_state(bad))
+        with self.assertRaises(ValueError):
+            py.pack_servo_state(3, servos)
+
     def test_fault_bit_names(self):
         self.assertEqual(py.decode_fault_bits(0), "none")
         self.assertEqual(py.decode_fault_bits(0x0001), "HEARTBEAT_LOST")

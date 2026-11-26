@@ -17,6 +17,10 @@
 //   protocol_tool valid-modes                    -> every value 0..255 accepted by is_valid_mode
 //   protocol_tool pack-joint-state <24 numbers>  -> payload hex (position, current, temp) x 8
 //   protocol_tool unpack-joint-state <hex>       -> 24 numbers, or "invalid"
+//   protocol_tool pack-servo-state <first-id> <32 numbers>  -> payload hex; per servo: present,
+//                                                   position, speed, load, current, voltage,
+//                                                   temperature, status
+//   protocol_tool unpack-servo-state <hex>       -> first-id and 32 numbers, or "invalid"
 //
 // Numeric arguments accept decimal or 0x-prefixed hex.
 
@@ -192,6 +196,42 @@ int main(int argc, char** argv) {
     }
     for (const hg::JointStateEntry& j : joints) {
       std::printf("%d %d %d ", j.position_cdeg, j.current, j.temperature);
+    }
+    std::printf("\n");
+    return 0;
+  }
+
+  if (cmd == "pack-servo-state" && argc == 3 + 8 * static_cast<int>(hg::kServoStateGroupSize)) {
+    hg::ServoStateEntry servos[hg::kServoStateGroupSize];
+    for (size_t i = 0; i < hg::kServoStateGroupSize; ++i) {
+      char** v = argv + 3 + 8 * i;
+      servos[i].present = std::strtol(v[0], nullptr, 0) != 0;
+      servos[i].position = static_cast<int16_t>(std::strtol(v[1], nullptr, 0));
+      servos[i].speed = static_cast<int16_t>(std::strtol(v[2], nullptr, 0));
+      servos[i].load = static_cast<int16_t>(std::strtol(v[3], nullptr, 0));
+      servos[i].current = static_cast<int16_t>(std::strtol(v[4], nullptr, 0));
+      servos[i].voltage = static_cast<uint8_t>(std::strtol(v[5], nullptr, 0));
+      servos[i].temperature = static_cast<uint8_t>(std::strtol(v[6], nullptr, 0));
+      servos[i].status = static_cast<uint8_t>(std::strtol(v[7], nullptr, 0));
+    }
+    uint8_t payload[hg::kServoStatePayloadSize];
+    hg::pack_servo_state(static_cast<uint8_t>(parse_number(argv[2])), servos, payload);
+    std::printf("%s\n", to_hex(payload, sizeof(payload)).c_str());
+    return 0;
+  }
+
+  if (cmd == "unpack-servo-state" && argc == 3) {
+    if (!parse_hex(argv[2], &bytes)) return usage();
+    uint8_t first_id = 0;
+    hg::ServoStateEntry servos[hg::kServoStateGroupSize];
+    if (!hg::unpack_servo_state(bytes.data(), bytes.size(), &first_id, servos)) {
+      std::printf("invalid\n");
+      return 0;
+    }
+    std::printf("%u ", first_id);
+    for (const hg::ServoStateEntry& s : servos) {
+      std::printf("%d %d %d %d %d %u %u %u ", s.present ? 1 : 0, s.position, s.speed, s.load,
+                  s.current, s.voltage, s.temperature, s.status);
     }
     std::printf("\n");
     return 0;

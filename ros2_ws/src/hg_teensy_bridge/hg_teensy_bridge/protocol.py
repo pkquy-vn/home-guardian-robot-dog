@@ -38,6 +38,7 @@ CONTACT = 0x14
 BATTERY = 0x15
 STATUS = 0x16
 FAULT = 0x17
+SERVO_STATE = 0x18
 
 # Posture modes: requested with MODE, reported in STATUS.
 MODE_LIE = 0
@@ -74,6 +75,31 @@ JOINT_ORDER = (
 NUM_JOINTS = len(JOINT_ORDER)
 JOINT_STATE_ENTRY_FORMAT = "<hhb"
 JOINT_STATE_PAYLOAD_SIZE = NUM_JOINTS * struct.calcsize(JOINT_STATE_ENTRY_FORMAT)  # 40
+
+# SERVO_STATE: telemetry of the bus servos, IDs 1..8 (ID = JOINT_ORDER index + 1), four servos per
+# message: uint8 first servo ID (1 or 5), then 4 x (uint8 flags, int16 position, int16 speed,
+# int16 load, int16 current, uint8 voltage, uint8 temperature, uint8 status).
+NUM_SERVOS = NUM_JOINTS
+SERVO_STATE_GROUP_SIZE = 4
+SERVO_STATE_ENTRY_FORMAT = "<BhhhhBBB"
+SERVO_STATE_ENTRY_SIZE = struct.calcsize(SERVO_STATE_ENTRY_FORMAT)  # 12
+SERVO_STATE_PAYLOAD_SIZE = 1 + SERVO_STATE_GROUP_SIZE * SERVO_STATE_ENTRY_SIZE  # 49
+SERVO_FLAG_PRESENT = 0x01
+
+# Units of the SERVO_STATE fields. Keep in sync with firmware/src/servo_registers.h.
+SERVO_COUNTS_PER_REV = 4096  # position: counts, raw (no calibration)
+SERVO_LOAD_PERCENT_PER_COUNT = 0.1
+SERVO_VOLTS_PER_COUNT = 0.1
+SERVO_MILLIAMPS_PER_COUNT = 6.5  # approximate: to be checked against a meter
+# Status byte bits, from Feetech's STS memory table (to be confirmed for the STS3250).
+SERVO_STATUS_BIT_NAMES = {
+    0: "VOLTAGE",
+    1: "SENSOR",
+    2: "TEMPERATURE",
+    3: "CURRENT",
+    4: "ANGLE",
+    5: "OVERLOAD",
+}
 
 
 def crc16_ccitt_false(data: bytes, crc: int = CRC_INIT) -> int:
@@ -208,6 +234,49 @@ def unpack_joint_state(payload: bytes) -> Optional[list[tuple[int, int, int]]]:
     if len(payload) != JOINT_STATE_PAYLOAD_SIZE:
         return None
     return list(struct.iter_unpack(JOINT_STATE_ENTRY_FORMAT, payload))
+
+
+def is_valid_servo_group(first_id: int) -> bool:
+    """True for the first servo ID of a SERVO_STATE group: 1 or 5."""
+    return (
+        1 <= first_id <= NUM_SERVOS - SERVO_STATE_GROUP_SIZE + 1
+        and (first_id - 1) % SERVO_STATE_GROUP_SIZE == 0
+    )
+
+
+def pack_servo_state(first_id: int, servos: Sequence[tuple]) -> bytes:
+    """SERVO_STATE payload from the group's first servo ID and 4 tuples of
+    (present, position, speed, load, current, voltage, temperature, status)."""
+    if not is_valid_servo_group(first_id):
+        raise ValueError(f"invalid first servo ID: {first_id}")
+    if len(servos) != SERVO_STATE_GROUP_SIZE:
+        raise ValueError(f"expected {SERVO_STATE_GROUP_SIZE} servos, got {len(servos)}")
+    payload = bytes([first_id])
+    for present, *values in servos:
+        flags = SERVO_FLAG_PRESENT if present else 0
+        payload += struct.pack(SERVO_STATE_ENTRY_FORMAT, flags, *values)
+    return payload
+
+
+def unpack_servo_state(payload: bytes) -> Optional[tuple[int, list[tuple]]]:
+    """Returns (first servo ID, 4 tuples of (present, position, speed, load, current, voltage,
+    temperature, status)), or None if the size or the first servo ID is wrong."""
+    if len(payload) != SERVO_STATE_PAYLOAD_SIZE or not is_valid_servo_group(payload[0]):
+        return None
+    servos = []
+    for flags, *values in struct.iter_unpack(SERVO_STATE_ENTRY_FORMAT, payload[1:]):
+        servos.append((bool(flags & SERVO_FLAG_PRESENT), *values))
+    return payload[0], servos
+
+
+def decode_servo_status(status: int) -> str:
+    if status == 0:
+        return "none"
+    names = []
+    for bit in range(8):
+        if status & (1 << bit):
+            names.append(SERVO_STATUS_BIT_NAMES.get(bit, f"BIT{bit}"))
+    return ",".join(names)
 
 
 def decode_fault_bits(bits: int) -> str:
