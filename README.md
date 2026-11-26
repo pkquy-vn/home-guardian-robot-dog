@@ -7,8 +7,8 @@
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 > **Status: early development.** The real-time firmware, the Pi–Teensy link and the first ROS 2
-> packages are in place. Servo telemetry is read, but the servos are not driven yet. Sensors
-> and autonomy are not integrated.
+> packages are in place. Calibrated joints follow the posture modes; this is being tested on
+> one leg. Walking, sensors and autonomy are not integrated.
 
 ## Overview
 
@@ -35,14 +35,14 @@ flowchart LR
     apps["Navigation, perception, behavior (planned)"] --> bridge["hg_teensy_bridge"]
   end
   subgraph Teensy["Teensy 4.1 - firmware"]
-    fw["Posture modes, kinematics, heartbeat watchdog"]
+    fw["Posture modes, kinematics, servo safety, heartbeat watchdog"]
   end
   bridge <-->|"USB serial, framed protocol with CRC"| fw
-  fw <-->|"Half-duplex servo bus"| joints["8 STS3250 servos (telemetry only for now)"]
+  fw <-->|"Half-duplex servo bus"| joints["8 STS3250 servos"]
 ```
 
-The Pi sends commands and a 20 Hz heartbeat. The Teensy reports status and joint states, and falls
-back to a safe posture if the heartbeat stops.
+The Pi sends commands and a 20 Hz heartbeat. The Teensy drives the servos, reports status and
+joint states, and falls back to a safe posture if the heartbeat stops.
 
 ## Repository structure
 
@@ -88,6 +88,7 @@ firmware/test_host/run_tests.sh
 - [Serial protocol, posture modes and faults](docs/protocol.md)
 - [Kinematics, reference poses and joint conventions](docs/kinematics.md)
 - [Servo bus: wiring, registers, timing and telemetry](docs/servo-bus.md)
+- [Servo motion: calibration, torque rules and safety limits](docs/servo-motion.md)
 - [ROS 2 bridge: topics, services and parameters](ros2_ws/src/hg_teensy_bridge/README.md)
 - [Thermal camera: driver, person and fire detection](ros2_ws/src/hg_perception/README.md)
 - [Raspberry Pi setup](docs/setup/raspberry-pi.md)
@@ -99,8 +100,8 @@ firmware/test_host/run_tests.sh
 - [x] Posture modes (lie, sit, stand) with a latching heartbeat watchdog
 - [x] Leg kinematics and smooth joint-level posture transitions
 - [x] ROS 2 bridge, robot model (URDF) and CI builds
-- [x] Servo bus: presence and telemetry of the STS3250 servos (read-only)
-- [ ] Servo calibration and motion
+- [x] Servo bus: presence and telemetry of the STS3250 servos
+- [ ] Servo calibration and motion (implemented, in single-leg testing)
 - [ ] Walking gait
 - [ ] IMU, foot contact and battery sensing
 - [ ] Mapping, localization and navigation

@@ -19,8 +19,9 @@ Home Guardian is a custom 8-DOF quadruped robot for autonomous indoor patrol.
   `ros2_ws/src/hg_teensy_bridge/hg_teensy_bridge/protocol.py`, used by the bridge node and
   `tools/test_link.py`. USB serial for now; hardware UART deferred
   (`docs/decisions/0001-usb-serial-link.md`).
-- Implemented message types: HEARTBEAT, MODE, CLEAR_FAULT (Pi → Teensy), STATUS, JOINT_STATE and
-  SERVO_STATE (Teensy → Pi). All other IDs are reserved without a payload definition.
+- Implemented message types: HEARTBEAT, MODE, CLEAR_FAULT, CALIBRATION, JOINT_TARGET,
+  SPEED_LIMIT (Pi → Teensy), STATUS, JOINT_STATE, SERVO_STATE, JOINT_STATUS, FAULT and ACK
+  (Teensy → Pi). All other IDs are reserved without a payload definition.
 - Firmware safety logic: posture mode state machine and latching heartbeat watchdog in
   `firmware/src/posture.h` (plain C++, host-tested). See
   `docs/decisions/0002-heartbeat-loss-latches.md`.
@@ -28,8 +29,12 @@ Home Guardian is a custom 8-DOF quadruped robot for autonomous indoor patrol.
   `firmware/src/kinematics.h`; conventions, poses and the URDF mapping in `docs/kinematics.md`.
   Keep `hg_description` consistent with it.
 - Servo bus (high risk): Feetech STS3250 servos, IDs 1-8, on Teensy `Serial1` half-duplex
-  (`firmware/src/servo_*.h`, `docs/servo-bus.md`). Read-only so far: the firmware only sends PING
-  and READ, and reports telemetry in SERVO_STATE.
+  (`firmware/src/servo_*.h`, `docs/servo-bus.md`).
+- Servo motion (high risk, not host-tested): torque rules, rate-limited motion and servo faults
+  in `firmware/src/joint_control.h`; joint calibration (Teensy EEPROM) in
+  `firmware/src/calibration.h`. See `docs/servo-motion.md` and
+  `docs/decisions/0003-joint-calibration-in-teensy-eeprom.md`. Pi side: the `servo` tool in
+  `hg_teensy_bridge`. Being tested on one leg (FL: servo IDs 1 and 2).
 - **The repository is public.**
 
 ## Build and test
@@ -86,11 +91,22 @@ CI runs on every push and pull request: `firmware.yml` (host tests, `pio run`) a
   destroy the Pi.
 - **Do not upload firmware to the Teensy without asking the owner first.**
 - Ask before running `sudo` or installing system packages on the Pi.
-- **The firmware must not move a servo yet.** It never enables torque and never writes a goal
-  position. `ServoBus` refuses WRITE and SYNC WRITE unless `set_writes_enabled(true)` is called;
-  do not call it, or add any servo write, without the owner's explicit go-ahead.
+- **Servo torque rules (`docs/servo-motion.md`). Do not weaken any of them without the owner's
+  explicit go-ahead:**
+  - Everything is limp at boot. Torque only after an explicit SIT, STAND, WALK or JOINT_TARGET.
+  - A joint that is not calibrated never gets torque.
+  - Torque is enabled only after the servo has reported a goal equal to its measured position.
+  - Every target is clamped to the joint limits and rate-limited in the firmware, whatever the
+    Pi sends.
+  - Servo faults (temperature, current, missing, torque lost) latch and remove torque without
+    the Pi.
+- **Never write a servo's own EEPROM** (ID, baud rate, angle limits, offset). `ServoBus` only
+  allows writes to torque enable (0 or 1) and the goal registers (40 to 47); do not widen that.
+  Never write 128 to torque enable: it stores an offset in the servo.
 - The servo bus must never stall the 200 Hz control loop: no bus I/O in the timer interrupt, at
-  most one transaction per control tick, no blocking calls (`flush()`, waiting for a reply).
+  most one sync write each for torque off, goals and torque on plus one read per control tick,
+  no blocking calls (`flush()`, waiting for a reply). The only blocking call in the firmware is
+  saving the calibration, which is refused unless every servo is limp.
 - Only one program can use `/dev/ttyACM0` at a time. Keep ModemManager disabled, because it
   probes new serial devices.
 

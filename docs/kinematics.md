@@ -12,8 +12,8 @@ Implemented in [`firmware/src/kinematics.h`](../firmware/src/kinematics.h) (host
   then knee. Hip pitch axes at x = +93 mm (front) / -93 mm (rear), y = +95 mm (left) / -95 mm
   (right), z = 0.
 - Femur L1 = 108 mm, tibia L2 = 130 mm to the foot contact point.
-- The same joint conventions apply to all four legs. Servo direction signs and offsets are a
-  later calibration concern.
+- The same joint conventions apply to all four legs. Each servo's direction sign and reference
+  position are set by calibration; see [servo-motion.md](servo-motion.md).
 
 ## Joint conventions
 
@@ -71,13 +71,15 @@ During a posture transition (1.6 s for LIE to STAND, 1.0 s otherwise), the firmw
 eight joint angles from the angles commanded at the start of the transition to the target pose,
 using a minimum-jerk profile: s = 10p³ - 15p⁴ + 6p⁵, with zero velocity and acceleration at both
 ends. An aborted transition, for example the forced SIT after a heartbeat loss, starts from the
-angles commanded at that moment. There are no servos yet, so the angles are only reported.
+angles commanded at that moment. These are posture targets: joints whose servo is present and
+calibrated follow them, limited to the speed limit ([servo-motion.md](servo-motion.md)).
 
 ## JOINT_STATE and /joint_states
 
 The firmware sends JOINT_STATE at 50 Hz: 8 x (int16 position in 0.01 deg, int16 current, int8
-temperature), ordered FL hip, FL knee, FR hip, FR knee, RL hip, RL knee, RR hip, RR knee. Until
-servos exist, position is the commanded angle and current and temperature are 0.
+temperature), ordered FL hip, FL knee, FR hip, FR knee, RL hip, RL knee, RR hip, RR knee. For a
+joint whose servo is present and calibrated, the position is the measured joint angle. For every
+other joint it is the commanded angle, and current and temperature are 0.
 
 The bridge publishes `sensor_msgs/JointState` on `/joint_states` in radians. It uses the URDF
 joint names `fl_hip_joint`, `fl_knee_joint`, ... `rr_knee_joint`, and leaves `effort` and
