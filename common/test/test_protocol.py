@@ -261,6 +261,114 @@ class PayloadTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             py.pack_servo_state(3, servos)
 
+    def check_payload(self, name, py_pack, py_unpack, values, wire_hex, msg_type, size):
+        """One pack/unpack case: both sides agree with each other and with the wire bytes."""
+        payload = py_pack(*values)
+        args = [str(v) for v in values]
+        self.assertEqual(payload.hex(), wire_hex)
+        self.assertEqual(len(payload), size)
+        self.assertEqual(cpp(f"pack-{name}", *args), wire_hex)
+        self.assertEqual(cpp(f"unpack-{name}", wire_hex).split(), args)
+        self.assertEqual(py_unpack(payload), tuple(values))
+        self.assertEqual(cpp_encode(msg_type, payload), py.encode_frame(msg_type, payload))
+        for bad in (payload[:-1], payload + b"\x00"):
+            self.assertEqual(cpp(f"unpack-{name}", bad.hex()), "invalid")
+            self.assertIsNone(py_unpack(bad))
+
+    def test_calibration_payload(self):
+        self.assertEqual((py.CALIBRATION, py.CALIBRATION_PAYLOAD_SIZE), (0x09, 5))
+        self.assertEqual((py.CAL_CAPTURE, py.CAL_SET_DIRECTION, py.CAL_RESTORE), (1, 2, 3))
+        cases = [
+            ((py.CAL_CAPTURE, 1, 1, 0), "0101010000"),
+            ((py.CAL_SET_DIRECTION, 7, -1, 0), "0207ff0000"),
+            ((py.CAL_RESTORE, 0, -1, 2047), "0300ffff07"),
+            ((py.CAL_RESTORE, 6, 1, -2), "030601feff"),
+        ]
+        for values, wire_hex in cases:
+            with self.subTest(values=values):
+                self.check_payload(
+                    "calibration", py.pack_calibration, py.unpack_calibration, values, wire_hex,
+                    py.CALIBRATION, 5,
+                )
+
+    def test_joint_target_payload(self):
+        self.assertEqual((py.JOINT_TARGET, py.JOINT_TARGET_PAYLOAD_SIZE), (0x0A, 3))
+        cases = [((1, 10000), "011027"), ((0, -4500), "006cee"), ((7, 0), "070000")]
+        for values, wire_hex in cases:
+            with self.subTest(values=values):
+                self.check_payload(
+                    "joint-target", py.pack_joint_target, py.unpack_joint_target, values, wire_hex,
+                    py.JOINT_TARGET, 3,
+                )
+
+    def test_speed_limit_payload(self):
+        self.assertEqual((py.SPEED_LIMIT, py.SPEED_LIMIT_PAYLOAD_SIZE), (0x0B, 2))
+        for speed, wire_hex in [(600, "5802"), (0, "0000"), (65535, "ffff")]:
+            with self.subTest(speed=speed):
+                self.assertEqual(py.pack_speed_limit(speed).hex(), wire_hex)
+                self.assertEqual(cpp("pack-speed-limit", str(speed)), wire_hex)
+                self.assertEqual(cpp("unpack-speed-limit", wire_hex), str(speed))
+                self.assertEqual(py.unpack_speed_limit(bytes.fromhex(wire_hex)), speed)
+        self.assertEqual(cpp("unpack-speed-limit", "58"), "invalid")
+        self.assertIsNone(py.unpack_speed_limit(b"\x58\x02\x00"))
+
+    def test_fault_payload(self):
+        self.assertEqual((py.FAULT, py.FAULT_PAYLOAD_SIZE), (0x17, 5))
+        cases = [
+            ((py.FAULT_SERVO_OVERCURRENT, 1, 3900), "0800013c0f"),
+            ((py.FAULT_SERVO_OVERHEAT, 0, 71), "0400004700"),
+            ((py.FAULT_SERVO_MISSING, py.NO_JOINT, -1), "1000ffffff"),
+        ]
+        for values, wire_hex in cases:
+            with self.subTest(values=values):
+                self.check_payload(
+                    "fault", py.pack_fault, py.unpack_fault, values, wire_hex, py.FAULT, 5
+                )
+        self.assertEqual(
+            (py.FAULT_HEARTBEAT_LOST, py.FAULT_SERVO_HOT, py.FAULT_SERVO_TORQUE_LOST), (1, 2, 32)
+        )
+
+    def test_joint_status_payload(self):
+        joints = [
+            (py.JOINT_CALIBRATED | py.JOINT_TORQUE_ON | py.JOINT_DRIVEN | py.JOINT_MEASURED, 0,
+             2047, 0),
+            (py.JOINT_CALIBRATED | py.JOINT_DIRECTION_NEGATIVE | py.JOINT_TEST_TARGET, 3,
+             1024, 10000),
+            (0, 1, 0, 604),
+            (0, 2, -1, -4500),
+            (255, 255, 32767, 32767),
+            (1, 5, -32768, -32768),
+            (0, 4, 4095, 15000),
+            (py.JOINT_DIRECTION_NEGATIVE, 1, 0, 3522),
+        ]
+        payload = py.pack_joint_status(600, joints)
+        self.assertEqual((py.JOINT_STATUS, len(payload), py.JOINT_STATUS_PAYLOAD_SIZE),
+                         (0x19, 50, 50))
+        # Speed limit, then the first entry: flags, block, little-endian reference and target.
+        self.assertEqual(payload[:14].hex(), "5802" + "2d00ff070000" + "1303" + "0004" + "1027")
+        args = ["600"] + [str(v) for joint in joints for v in joint]
+        self.assertEqual(cpp("pack-joint-status", *args), payload.hex())
+        self.assertEqual(cpp("unpack-joint-status", payload.hex()).split(), args)
+        self.assertEqual(py.unpack_joint_status(payload), (600, joints))
+        self.assertEqual(cpp_encode(py.JOINT_STATUS, payload),
+                         py.encode_frame(py.JOINT_STATUS, payload))
+        self.assertEqual(cpp("unpack-joint-status", payload[:-1].hex()), "invalid")
+        self.assertIsNone(py.unpack_joint_status(payload + b"\x00"))
+        with self.assertRaises(ValueError):
+            py.pack_joint_status(600, joints[:7])
+
+    def test_ack_payload(self):
+        self.assertEqual((py.ACK, py.ACK_PAYLOAD_SIZE), (0x1A, 5))
+        cases = [
+            ((py.MODE, py.ACK_OK, py.NO_JOINT, 2), "0400ff0200"),
+            ((py.CALIBRATION, py.ACK_RANGE_ERROR, 1, 2047), "090b01ff07"),
+            ((py.JOINT_TARGET, 8, 0, -4500), "0a08006cee"),
+            ((py.SPEED_LIMIT, py.ACK_OK, py.NO_JOINT, 600), "0b00ff5802"),
+        ]
+        for values, wire_hex in cases:
+            with self.subTest(values=values):
+                self.check_payload("ack", py.pack_ack, py.unpack_ack, values, wire_hex, py.ACK, 5)
+
     def test_fault_bit_names(self):
         self.assertEqual(py.decode_fault_bits(0), "none")
         self.assertEqual(py.decode_fault_bits(0x0001), "HEARTBEAT_LOST")

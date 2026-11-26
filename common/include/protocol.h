@@ -37,28 +37,32 @@ constexpr size_t kMaxFrameSize = kHeaderSize + kMaxPayload + kCrcSize;
 constexpr uint16_t kCrcInit = 0xFFFF;
 constexpr uint16_t kCrcPoly = 0x1021;
 
-// Message type IDs. kHeartbeat, kMode, kClearFault, kJointState, kStatus and kServoState have
-// defined payloads; the others are reserved IDs whose payloads will be specified when they are
-// implemented.
+// Message type IDs. The IDs marked "reserved" have no payload definition yet; their payloads
+// will be specified when they are implemented.
 enum class MsgType : uint8_t {
   // Pi -> Teensy
-  kHeartbeat = 0x01,   // HEARTBEAT
-  kCmdVel = 0x02,      // CMD_VEL
-  kBodyPose = 0x03,    // BODY_POSE
-  kMode = 0x04,        // MODE
-  kLed = 0x05,         // LED
-  kIrLed = 0x06,       // IR_LED
-  kConfig = 0x07,      // CONFIG
-  kClearFault = 0x08,  // CLEAR_FAULT
+  kHeartbeat = 0x01,    // HEARTBEAT
+  kCmdVel = 0x02,       // CMD_VEL
+  kBodyPose = 0x03,     // BODY_POSE
+  kMode = 0x04,         // MODE
+  kLed = 0x05,          // LED
+  kIrLed = 0x06,        // IR_LED
+  kConfig = 0x07,       // CONFIG
+  kClearFault = 0x08,   // CLEAR_FAULT
+  kCalibration = 0x09,  // CALIBRATION
+  kJointTarget = 0x0A,  // JOINT_TARGET
+  kSpeedLimit = 0x0B,   // SPEED_LIMIT
   // Teensy -> Pi
-  kJointState = 0x11,  // JOINT_STATE
-  kImu = 0x12,         // IMU
-  kOdom = 0x13,        // ODOM
-  kContact = 0x14,     // CONTACT
-  kBattery = 0x15,     // BATTERY
-  kStatus = 0x16,      // STATUS
-  kFault = 0x17,       // FAULT
-  kServoState = 0x18,  // SERVO_STATE
+  kJointState = 0x11,   // JOINT_STATE
+  kImu = 0x12,          // IMU
+  kOdom = 0x13,         // ODOM
+  kContact = 0x14,      // CONTACT
+  kBattery = 0x15,      // BATTERY
+  kStatus = 0x16,       // STATUS
+  kFault = 0x17,        // FAULT
+  kServoState = 0x18,   // SERVO_STATE
+  kJointStatus = 0x19,  // JOINT_STATUS
+  kAck = 0x1A,          // ACK
 };
 
 // Posture modes: requested with MODE, reported in StatusPayload::mode.
@@ -77,8 +81,21 @@ inline bool is_valid_mode(uint8_t value) {
          value == static_cast<uint8_t>(Mode::kTorqueOff);
 }
 
-// Fault bits reported in StatusPayload::fault_bits.
-constexpr uint16_t kFaultHeartbeatLost = 1u << 0;  // HEARTBEAT_LOST
+// Fault bits reported in StatusPayload::fault_bits. Every fault latches until CLEAR_FAULT
+// (HEARTBEAT_LOST before the first heartbeat after boot clears by itself).
+constexpr uint16_t kFaultHeartbeatLost = 1u << 0;     // HEARTBEAT_LOST
+constexpr uint16_t kFaultServoHot = 1u << 1;          // SERVO_HOT: >= 65 C, went to LIE
+constexpr uint16_t kFaultServoOverheat = 1u << 2;     // SERVO_OVERHEAT: >= 70 C, torque off
+constexpr uint16_t kFaultServoOvercurrent = 1u << 3;  // SERVO_OVERCURRENT: torque off
+constexpr uint16_t kFaultServoMissing = 1u << 4;     // SERVO_MISSING: driven servo gone, torque off
+constexpr uint16_t kFaultServoTorqueLost = 1u << 5;  // SERVO_TORQUE_LOST: see docs, torque off
+// Faults whose response is torque off on all servos at once.
+constexpr uint16_t kTorqueOffFaults =
+    kFaultServoOverheat | kFaultServoOvercurrent | kFaultServoMissing | kFaultServoTorqueLost;
+constexpr uint16_t kServoFaults = kFaultServoHot | kTorqueOffFaults;
+
+// Joint value meaning "no joint" in FAULT and ACK.
+constexpr uint8_t kNoJoint = 0xFF;
 
 // ---------------------------------------------------------------------------------------------
 // Little-endian helpers
@@ -315,8 +332,10 @@ inline bool unpack_status(const uint8_t* payload, size_t len, StatusPayload* sta
   return true;
 }
 
-// JOINT_STATE (Teensy -> Pi): 8 x (int16 position in 0.01 deg, int16 current, int8
-// temperature), in JointIndex order. Until servos exist, position is the commanded angle and
+// JOINT_STATE (Teensy -> Pi): 8 x (int16 position in 0.01 deg, int16 current in mA, int8
+// temperature in deg C), in JointIndex order. For a joint whose servo is present and calibrated
+// (JOINT_STATUS flag kJointMeasured) these are measured values in the joint conventions of
+// docs/kinematics.md. For every other joint the position is the commanded posture angle and
 // current and temperature are 0.
 enum class JointIndex : uint8_t {
   kFlHip = 0,
@@ -334,8 +353,8 @@ constexpr size_t kJointStatePayloadSize = kNumJoints * kJointStateEntrySize;  //
 
 struct JointStateEntry {
   int16_t position_cdeg = 0;  // 0.01 deg
-  int16_t current = 0;        // Unit to be defined with the servos.
-  int8_t temperature = 0;     // Unit to be defined with the servos.
+  int16_t current = 0;        // mA
+  int8_t temperature = 0;     // deg C
 };
 
 inline void pack_joint_state(const JointStateEntry (&joints)[kNumJoints], uint8_t* out) {
@@ -423,6 +442,211 @@ inline bool unpack_servo_state(const uint8_t* payload, size_t len, uint8_t* firs
     servos[i].temperature = entry[10];
     servos[i].status = entry[11];
   }
+  return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Servo motion: calibration, test targets, status, faults and acknowledgements
+// ---------------------------------------------------------------------------------------------
+
+// CALIBRATION (Pi -> Teensy): uint8 operation, uint8 joint (JointIndex), int8 direction,
+// int16 reference. Changes one joint's calibration, stored in the Teensy's EEPROM. Accepted
+// only while no servo has torque.
+//   kCalCapture:      store the servo's current position as the reference pose (hip 0 deg, knee
+//                     interior 90 deg). direction and reference are ignored.
+//   kCalSetDirection: set the direction sign to +1 or -1. reference is ignored.
+//   kCalRestore:      set direction and reference (servo counts) from the Pi's saved copy.
+constexpr uint8_t kCalCapture = 1;
+constexpr uint8_t kCalSetDirection = 2;
+constexpr uint8_t kCalRestore = 3;
+constexpr size_t kCalibrationPayloadSize = 5;
+
+struct CalibrationPayload {
+  uint8_t operation = 0;
+  uint8_t joint = 0;
+  int8_t direction = 1;
+  int16_t reference = 0;
+};
+
+inline void pack_calibration(const CalibrationPayload& c, uint8_t* out) {
+  out[0] = c.operation;
+  out[1] = c.joint;
+  out[2] = static_cast<uint8_t>(c.direction);
+  put_u16le(out + 3, static_cast<uint16_t>(c.reference));
+}
+
+inline bool unpack_calibration(const uint8_t* payload, size_t len, CalibrationPayload* c) {
+  if (len != kCalibrationPayloadSize || payload == nullptr || c == nullptr) return false;
+  c->operation = payload[0];
+  c->joint = payload[1];
+  c->direction = static_cast<int8_t>(payload[2]);
+  c->reference = static_cast<int16_t>(get_u16le(payload + 3));
+  return true;
+}
+
+// JOINT_TARGET (Pi -> Teensy): uint8 joint, int16 angle in 0.01 deg. Test command: drives one
+// joint to an angle (clamped to the joint limits, rate-limited) until the next MODE command.
+constexpr size_t kJointTargetPayloadSize = 3;
+
+inline void pack_joint_target(uint8_t joint, int16_t angle_cdeg, uint8_t* out) {
+  out[0] = joint;
+  put_u16le(out + 1, static_cast<uint16_t>(angle_cdeg));
+}
+
+inline bool unpack_joint_target(const uint8_t* payload, size_t len, uint8_t* joint,
+                                int16_t* angle_cdeg) {
+  if (len != kJointTargetPayloadSize || payload == nullptr || joint == nullptr ||
+      angle_cdeg == nullptr) {
+    return false;
+  }
+  *joint = payload[0];
+  *angle_cdeg = static_cast<int16_t>(get_u16le(payload + 1));
+  return true;
+}
+
+// SPEED_LIMIT (Pi -> Teensy): uint16 maximum joint speed in 0.1 deg/s. The firmware clamps it
+// to its own range and reports the value in use in ACK and JOINT_STATUS. Not stored: the default
+// applies again after a reset.
+constexpr size_t kSpeedLimitPayloadSize = 2;
+
+inline void pack_speed_limit(uint16_t speed_ddeg_s, uint8_t* out) { put_u16le(out, speed_ddeg_s); }
+
+inline bool unpack_speed_limit(const uint8_t* payload, size_t len, uint16_t* speed_ddeg_s) {
+  if (len != kSpeedLimitPayloadSize || payload == nullptr || speed_ddeg_s == nullptr) return false;
+  *speed_ddeg_s = get_u16le(payload);
+  return true;
+}
+
+// FAULT (Teensy -> Pi): uint16 fault (exactly one fault bit), uint8 joint (JointIndex, or
+// kNoJoint), int16 value. The cause of one latched servo fault: the joint that tripped it and
+// the value that did (temperature in deg C, current in mA, otherwise 0). Sent when the fault
+// latches and once per second while it stays latched.
+constexpr size_t kFaultPayloadSize = 5;
+
+struct FaultPayload {
+  uint16_t fault = 0;
+  uint8_t joint = kNoJoint;
+  int16_t value = 0;
+};
+
+inline void pack_fault(const FaultPayload& f, uint8_t* out) {
+  put_u16le(out, f.fault);
+  out[2] = f.joint;
+  put_u16le(out + 3, static_cast<uint16_t>(f.value));
+}
+
+inline bool unpack_fault(const uint8_t* payload, size_t len, FaultPayload* f) {
+  if (len != kFaultPayloadSize || payload == nullptr || f == nullptr) return false;
+  f->fault = get_u16le(payload);
+  f->joint = payload[2];
+  f->value = static_cast<int16_t>(get_u16le(payload + 3));
+  return true;
+}
+
+// JOINT_STATUS (Teensy -> Pi, 10 Hz): uint16 speed limit in 0.1 deg/s, then 8 x (uint8 flags,
+// uint8 block, int16 reference, int16 target in 0.01 deg), in JointIndex order. reference is the
+// calibration: the servo position in counts at the reference pose. target is the angle the joint
+// is (or would be) driven to: the posture or test target, clamped to the joint limits.
+constexpr uint8_t kJointCalibrated = 1u << 0;         // A reference is stored.
+constexpr uint8_t kJointDirectionNegative = 1u << 1;  // Direction sign is -1.
+constexpr uint8_t kJointTorqueOn = 1u << 2;           // The servo reports torque on.
+constexpr uint8_t kJointDriven = 1u << 3;             // The firmware is driving this joint.
+constexpr uint8_t kJointTestTarget = 1u << 4;         // A JOINT_TARGET test target is active.
+constexpr uint8_t kJointMeasured = 1u << 5;           // JOINT_STATE carries measured values for it.
+
+// JointStatusEntry::block: why the joint cannot be given torque right now. kNone: it can.
+enum class JointBlock : uint8_t {
+  kNone = 0,
+  kNotPresent = 1,     // The servo is not answering.
+  kNotCalibrated = 2,  // No reference stored.
+  kRangeError = 3,     // The joint range crosses the servo's 0/4095 point: flip or remount.
+  kServoMode = 4,      // The servo is not in position mode (its register 33 is not 0).
+  kOutOfRange = 5,     // The measured angle is far outside the joint limits.
+};
+
+constexpr size_t kJointStatusEntrySize = 6;
+constexpr size_t kJointStatusPayloadSize = 2 + kNumJoints * kJointStatusEntrySize;  // 50
+
+struct JointStatusEntry {
+  uint8_t flags = 0;
+  uint8_t block = 0;        // A JointBlock value.
+  int16_t reference = 0;    // servo counts
+  int16_t target_cdeg = 0;  // 0.01 deg
+};
+
+inline void pack_joint_status(uint16_t speed_limit_ddeg_s,
+                              const JointStatusEntry (&joints)[kNumJoints], uint8_t* out) {
+  put_u16le(out, speed_limit_ddeg_s);
+  for (size_t i = 0; i < kNumJoints; ++i) {
+    uint8_t* entry = out + 2 + i * kJointStatusEntrySize;
+    entry[0] = joints[i].flags;
+    entry[1] = joints[i].block;
+    put_u16le(entry + 2, static_cast<uint16_t>(joints[i].reference));
+    put_u16le(entry + 4, static_cast<uint16_t>(joints[i].target_cdeg));
+  }
+}
+
+inline bool unpack_joint_status(const uint8_t* payload, size_t len, uint16_t* speed_limit_ddeg_s,
+                                JointStatusEntry (&joints)[kNumJoints]) {
+  if (len != kJointStatusPayloadSize || payload == nullptr || speed_limit_ddeg_s == nullptr) {
+    return false;
+  }
+  *speed_limit_ddeg_s = get_u16le(payload);
+  for (size_t i = 0; i < kNumJoints; ++i) {
+    const uint8_t* entry = payload + 2 + i * kJointStatusEntrySize;
+    joints[i].flags = entry[0];
+    joints[i].block = entry[1];
+    joints[i].reference = static_cast<int16_t>(get_u16le(entry + 2));
+    joints[i].target_cdeg = static_cast<int16_t>(get_u16le(entry + 4));
+  }
+  return true;
+}
+
+// ACK (Teensy -> Pi): uint8 command (the MsgType answered), uint8 result (AckResult), uint8
+// joint (JointIndex, or kNoJoint), int16 value. Sent once for every MODE, CLEAR_FAULT,
+// CALIBRATION, JOINT_TARGET and SPEED_LIMIT received. value: MODE: the requested mode;
+// CALIBRATION: the stored reference in counts; JOINT_TARGET: the clamped target in 0.01 deg;
+// SPEED_LIMIT: the speed limit in use in 0.1 deg/s; otherwise 0.
+enum class AckResult : uint8_t {
+  kOk = 0,
+  kNoChange = 1,       // Already in the requested state; nothing to do.
+  kBadRequest = 2,     // Wrong payload size, or an unknown mode, operation, joint or value.
+  kFaultLatched = 3,   // Refused: a fault is latched. Send CLEAR_FAULT first.
+  kBusy = 4,           // Refused: a posture transition is in progress.
+  kNotAllowed = 5,     // Refused: not allowed in the current mode.
+  kTorqueOn = 6,       // Refused: calibration only changes while every servo is limp.
+  kNotPresent = 7,     // Refused: the joint's servo is not answering.
+  kNotCalibrated = 8,  // Refused: the joint is not calibrated.
+  kLinkUnhealthy = 9,  // CLEAR_FAULT refused: no healthy heartbeat.
+  kStorageError = 10,  // The calibration is in use but could not be saved to the EEPROM.
+  // The joint cannot be driven (see JointBlock). For CALIBRATION, kRangeError means: stored, but
+  // the joint will not get torque until its direction is flipped or the horn is remounted.
+  kRangeError = 11,
+  kServoMode = 12,
+  kOutOfRange = 13,
+};
+constexpr size_t kAckPayloadSize = 5;
+
+struct AckPayload {
+  uint8_t command = 0;
+  uint8_t result = 0;
+  uint8_t joint = kNoJoint;
+  int16_t value = 0;
+};
+
+inline void pack_ack(const AckPayload& a, uint8_t* out) {
+  out[0] = a.command;
+  out[1] = a.result;
+  out[2] = a.joint;
+  put_u16le(out + 3, static_cast<uint16_t>(a.value));
+}
+
+inline bool unpack_ack(const uint8_t* payload, size_t len, AckPayload* a) {
+  if (len != kAckPayloadSize || payload == nullptr || a == nullptr) return false;
+  a->command = payload[0];
+  a->result = payload[1];
+  a->joint = payload[2];
+  a->value = static_cast<int16_t>(get_u16le(payload + 3));
   return true;
 }
 

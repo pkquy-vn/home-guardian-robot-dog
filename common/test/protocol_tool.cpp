@@ -21,6 +21,19 @@
 //                                                   position, speed, load, current, voltage,
 //                                                   temperature, status
 //   protocol_tool unpack-servo-state <hex>       -> first-id and 32 numbers, or "invalid"
+//   protocol_tool pack-calibration <op> <joint> <direction> <reference>  -> payload hex
+//   protocol_tool unpack-calibration <hex>       -> the 4 numbers, or "invalid"
+//   protocol_tool pack-joint-target <joint> <cdeg>  -> payload hex
+//   protocol_tool unpack-joint-target <hex>      -> "<joint> <cdeg>", or "invalid"
+//   protocol_tool pack-speed-limit <ddeg/s>      -> payload hex
+//   protocol_tool unpack-speed-limit <hex>       -> speed limit, or "invalid"
+//   protocol_tool pack-fault <fault> <joint> <value>  -> payload hex
+//   protocol_tool unpack-fault <hex>             -> the 3 numbers, or "invalid"
+//   protocol_tool pack-joint-status <speed> <32 numbers>  -> payload hex; per joint: flags,
+//                                                   block, reference, target
+//   protocol_tool unpack-joint-status <hex>      -> speed and 32 numbers, or "invalid"
+//   protocol_tool pack-ack <command> <result> <joint> <value>  -> payload hex
+//   protocol_tool unpack-ack <hex>               -> the 4 numbers, or "invalid"
 //
 // Numeric arguments accept decimal or 0x-prefixed hex.
 
@@ -63,6 +76,10 @@ std::string to_hex(const uint8_t* data, size_t len) {
 }
 
 unsigned long parse_number(const char* text) { return std::strtoul(text, nullptr, 0); }
+
+long parse_signed(const char* text) { return std::strtol(text, nullptr, 0); }
+
+void print_hex(const uint8_t* data, size_t len) { std::printf("%s\n", to_hex(data, len).c_str()); }
 
 int usage() {
   std::fprintf(stderr, "usage: protocol_tool <command> [args...] (see source)\n");
@@ -234,6 +251,143 @@ int main(int argc, char** argv) {
                   s.current, s.voltage, s.temperature, s.status);
     }
     std::printf("\n");
+    return 0;
+  }
+
+  if (cmd == "pack-calibration" && argc == 6) {
+    hg::CalibrationPayload c;
+    c.operation = static_cast<uint8_t>(parse_number(argv[2]));
+    c.joint = static_cast<uint8_t>(parse_number(argv[3]));
+    c.direction = static_cast<int8_t>(parse_signed(argv[4]));
+    c.reference = static_cast<int16_t>(parse_signed(argv[5]));
+    uint8_t payload[hg::kCalibrationPayloadSize];
+    hg::pack_calibration(c, payload);
+    print_hex(payload, sizeof(payload));
+    return 0;
+  }
+
+  if (cmd == "unpack-calibration" && argc == 3) {
+    if (!parse_hex(argv[2], &bytes)) return usage();
+    hg::CalibrationPayload c;
+    if (!hg::unpack_calibration(bytes.data(), bytes.size(), &c)) {
+      std::printf("invalid\n");
+      return 0;
+    }
+    std::printf("%u %u %d %d\n", c.operation, c.joint, c.direction, c.reference);
+    return 0;
+  }
+
+  if (cmd == "pack-joint-target" && argc == 4) {
+    uint8_t payload[hg::kJointTargetPayloadSize];
+    hg::pack_joint_target(static_cast<uint8_t>(parse_number(argv[2])),
+                          static_cast<int16_t>(parse_signed(argv[3])), payload);
+    print_hex(payload, sizeof(payload));
+    return 0;
+  }
+
+  if (cmd == "unpack-joint-target" && argc == 3) {
+    if (!parse_hex(argv[2], &bytes)) return usage();
+    uint8_t joint = 0;
+    int16_t angle_cdeg = 0;
+    if (!hg::unpack_joint_target(bytes.data(), bytes.size(), &joint, &angle_cdeg)) {
+      std::printf("invalid\n");
+      return 0;
+    }
+    std::printf("%u %d\n", joint, angle_cdeg);
+    return 0;
+  }
+
+  if (cmd == "pack-speed-limit" && argc == 3) {
+    uint8_t payload[hg::kSpeedLimitPayloadSize];
+    hg::pack_speed_limit(static_cast<uint16_t>(parse_number(argv[2])), payload);
+    print_hex(payload, sizeof(payload));
+    return 0;
+  }
+
+  if (cmd == "unpack-speed-limit" && argc == 3) {
+    if (!parse_hex(argv[2], &bytes)) return usage();
+    uint16_t speed = 0;
+    if (!hg::unpack_speed_limit(bytes.data(), bytes.size(), &speed)) {
+      std::printf("invalid\n");
+      return 0;
+    }
+    std::printf("%u\n", speed);
+    return 0;
+  }
+
+  if (cmd == "pack-fault" && argc == 5) {
+    hg::FaultPayload f;
+    f.fault = static_cast<uint16_t>(parse_number(argv[2]));
+    f.joint = static_cast<uint8_t>(parse_number(argv[3]));
+    f.value = static_cast<int16_t>(parse_signed(argv[4]));
+    uint8_t payload[hg::kFaultPayloadSize];
+    hg::pack_fault(f, payload);
+    print_hex(payload, sizeof(payload));
+    return 0;
+  }
+
+  if (cmd == "unpack-fault" && argc == 3) {
+    if (!parse_hex(argv[2], &bytes)) return usage();
+    hg::FaultPayload f;
+    if (!hg::unpack_fault(bytes.data(), bytes.size(), &f)) {
+      std::printf("invalid\n");
+      return 0;
+    }
+    std::printf("%u %u %d\n", f.fault, f.joint, f.value);
+    return 0;
+  }
+
+  if (cmd == "pack-joint-status" && argc == 3 + 4 * static_cast<int>(hg::kNumJoints)) {
+    hg::JointStatusEntry joints[hg::kNumJoints];
+    for (size_t i = 0; i < hg::kNumJoints; ++i) {
+      char** v = argv + 3 + 4 * i;
+      joints[i].flags = static_cast<uint8_t>(parse_number(v[0]));
+      joints[i].block = static_cast<uint8_t>(parse_number(v[1]));
+      joints[i].reference = static_cast<int16_t>(parse_signed(v[2]));
+      joints[i].target_cdeg = static_cast<int16_t>(parse_signed(v[3]));
+    }
+    uint8_t payload[hg::kJointStatusPayloadSize];
+    hg::pack_joint_status(static_cast<uint16_t>(parse_number(argv[2])), joints, payload);
+    print_hex(payload, sizeof(payload));
+    return 0;
+  }
+
+  if (cmd == "unpack-joint-status" && argc == 3) {
+    if (!parse_hex(argv[2], &bytes)) return usage();
+    uint16_t speed = 0;
+    hg::JointStatusEntry joints[hg::kNumJoints];
+    if (!hg::unpack_joint_status(bytes.data(), bytes.size(), &speed, joints)) {
+      std::printf("invalid\n");
+      return 0;
+    }
+    std::printf("%u ", speed);
+    for (const hg::JointStatusEntry& j : joints) {
+      std::printf("%u %u %d %d ", j.flags, j.block, j.reference, j.target_cdeg);
+    }
+    std::printf("\n");
+    return 0;
+  }
+
+  if (cmd == "pack-ack" && argc == 6) {
+    hg::AckPayload a;
+    a.command = static_cast<uint8_t>(parse_number(argv[2]));
+    a.result = static_cast<uint8_t>(parse_number(argv[3]));
+    a.joint = static_cast<uint8_t>(parse_number(argv[4]));
+    a.value = static_cast<int16_t>(parse_signed(argv[5]));
+    uint8_t payload[hg::kAckPayloadSize];
+    hg::pack_ack(a, payload);
+    print_hex(payload, sizeof(payload));
+    return 0;
+  }
+
+  if (cmd == "unpack-ack" && argc == 3) {
+    if (!parse_hex(argv[2], &bytes)) return usage();
+    hg::AckPayload a;
+    if (!hg::unpack_ack(bytes.data(), bytes.size(), &a)) {
+      std::printf("invalid\n");
+      return 0;
+    }
+    std::printf("%u %u %u %d\n", a.command, a.result, a.joint, a.value);
     return 0;
   }
 

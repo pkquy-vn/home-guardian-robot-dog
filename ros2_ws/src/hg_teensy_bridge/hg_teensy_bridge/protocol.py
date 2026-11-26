@@ -30,6 +30,9 @@ LED = 0x05
 IR_LED = 0x06
 CONFIG = 0x07
 CLEAR_FAULT = 0x08
+CALIBRATION = 0x09
+JOINT_TARGET = 0x0A
+SPEED_LIMIT = 0x0B
 # Teensy -> Pi
 JOINT_STATE = 0x11
 IMU = 0x12
@@ -39,6 +42,17 @@ BATTERY = 0x15
 STATUS = 0x16
 FAULT = 0x17
 SERVO_STATE = 0x18
+JOINT_STATUS = 0x19
+ACK = 0x1A
+
+# Commands answered with an ACK, by message type.
+COMMAND_NAMES = {
+    MODE: "MODE",
+    CLEAR_FAULT: "CLEAR_FAULT",
+    CALIBRATION: "CALIBRATION",
+    JOINT_TARGET: "JOINT_TARGET",
+    SPEED_LIMIT: "SPEED_LIMIT",
+}
 
 # Posture modes: requested with MODE, reported in STATUS.
 MODE_LIE = 0
@@ -54,14 +68,31 @@ MODE_NAMES = {
     MODE_TORQUE_OFF: "TORQUE_OFF",
 }
 
-FAULT_BIT_NAMES = {0: "HEARTBEAT_LOST"}
+# Fault bits in STATUS. Every fault latches until CLEAR_FAULT.
+FAULT_HEARTBEAT_LOST = 1 << 0
+FAULT_SERVO_HOT = 1 << 1  # >= 65 C: went to LIE
+FAULT_SERVO_OVERHEAT = 1 << 2  # >= 70 C: torque off
+FAULT_SERVO_OVERCURRENT = 1 << 3  # torque off
+FAULT_SERVO_MISSING = 1 << 4  # a driven servo stopped answering: torque off
+FAULT_SERVO_TORQUE_LOST = 1 << 5  # a servo did not take or keep torque: torque off
+FAULT_BIT_NAMES = {
+    0: "HEARTBEAT_LOST",
+    1: "SERVO_HOT",
+    2: "SERVO_OVERHEAT",
+    3: "SERVO_OVERCURRENT",
+    4: "SERVO_MISSING",
+    5: "SERVO_TORQUE_LOST",
+}
+NO_JOINT = 0xFF  # "no joint" in FAULT and ACK
 
 HEARTBEAT_PAYLOAD_SIZE = 4
 MODE_PAYLOAD_SIZE = 1
 CLEAR_FAULT_PAYLOAD_SIZE = 0
 STATUS_PAYLOAD_SIZE = 4
 
-# JOINT_STATE: 8 x (int16 position in 0.01 deg, int16 current, int8 temperature), in this order.
+# JOINT_STATE: 8 x (int16 position in 0.01 deg, int16 current in mA, int8 temperature in deg C),
+# in this order. Measured values for a joint whose servo is present and calibrated (JOINT_STATUS
+# flag JOINT_MEASURED); otherwise the commanded posture angle, with current and temperature 0.
 JOINT_ORDER = (
     "FL hip",
     "FL knee",
@@ -73,6 +104,8 @@ JOINT_ORDER = (
     "RR knee",
 )
 NUM_JOINTS = len(JOINT_ORDER)
+# The same joints as identifiers, for command-line tools and files.
+JOINT_KEYS = tuple(name.lower().replace(" ", "_") for name in JOINT_ORDER)
 JOINT_STATE_ENTRY_FORMAT = "<hhb"
 JOINT_STATE_PAYLOAD_SIZE = NUM_JOINTS * struct.calcsize(JOINT_STATE_ENTRY_FORMAT)  # 40
 
@@ -99,6 +132,67 @@ SERVO_STATUS_BIT_NAMES = {
     3: "CURRENT",
     4: "ANGLE",
     5: "OVERLOAD",
+}
+
+# CALIBRATION: uint8 operation, uint8 joint, int8 direction, int16 reference (servo counts).
+CAL_CAPTURE = 1  # store the servo's current position as the reference pose
+CAL_SET_DIRECTION = 2  # set the direction sign (+1 or -1)
+CAL_RESTORE = 3  # set direction and reference from a saved copy
+CALIBRATION_FORMAT = "<BBbh"
+CALIBRATION_PAYLOAD_SIZE = struct.calcsize(CALIBRATION_FORMAT)  # 5
+
+# JOINT_TARGET: uint8 joint, int16 angle in 0.01 deg. SPEED_LIMIT: uint16 in 0.1 deg/s.
+JOINT_TARGET_FORMAT = "<Bh"
+JOINT_TARGET_PAYLOAD_SIZE = struct.calcsize(JOINT_TARGET_FORMAT)  # 3
+SPEED_LIMIT_FORMAT = "<H"
+SPEED_LIMIT_PAYLOAD_SIZE = struct.calcsize(SPEED_LIMIT_FORMAT)  # 2
+
+# FAULT: uint16 fault (one fault bit), uint8 joint (or NO_JOINT), int16 value (deg C or mA).
+FAULT_FORMAT = "<HBh"
+FAULT_PAYLOAD_SIZE = struct.calcsize(FAULT_FORMAT)  # 5
+
+# JOINT_STATUS: uint16 speed limit in 0.1 deg/s, then 8 x (uint8 flags, uint8 block,
+# int16 reference in servo counts, int16 target in 0.01 deg).
+JOINT_STATUS_ENTRY_FORMAT = "<BBhh"
+JOINT_STATUS_ENTRY_SIZE = struct.calcsize(JOINT_STATUS_ENTRY_FORMAT)  # 6
+JOINT_STATUS_PAYLOAD_SIZE = 2 + NUM_JOINTS * JOINT_STATUS_ENTRY_SIZE  # 50
+JOINT_CALIBRATED = 1 << 0
+JOINT_DIRECTION_NEGATIVE = 1 << 1
+JOINT_TORQUE_ON = 1 << 2  # the servo reports torque on
+JOINT_DRIVEN = 1 << 3  # the firmware is driving this joint
+JOINT_TEST_TARGET = 1 << 4  # a JOINT_TARGET test target is active
+JOINT_MEASURED = 1 << 5  # JOINT_STATE carries measured values for this joint
+# block: why the joint cannot be given torque right now.
+JOINT_BLOCK_NAMES = {
+    0: "none",
+    1: "servo not present",
+    2: "not calibrated",
+    3: "joint range does not fit the servo range: flip the direction or remount the horn",
+    4: "servo is not in position mode",
+    5: "measured angle is far outside the joint limits: check the calibration",
+}
+
+# ACK: uint8 command (message type), uint8 result, uint8 joint (or NO_JOINT), int16 value.
+ACK_FORMAT = "<BBBh"
+ACK_PAYLOAD_SIZE = struct.calcsize(ACK_FORMAT)  # 5
+ACK_OK = 0
+ACK_NO_CHANGE = 1
+ACK_RANGE_ERROR = 11
+ACK_RESULT_NAMES = {
+    0: "OK",
+    1: "no change",
+    2: "bad request",
+    3: "refused: a fault is latched, clear it first",
+    4: "refused: a posture transition is in progress",
+    5: "refused: not allowed in the current mode",
+    6: "refused: a servo has torque (calibration only changes while everything is limp)",
+    7: "refused: the servo is not present",
+    8: "refused: the joint is not calibrated",
+    9: "refused: no healthy heartbeat",
+    10: "calibration is in use but could not be saved to the Teensy's EEPROM",
+    11: "joint range does not fit the servo range: flip the direction or remount the horn",
+    12: "refused: the servo is not in position mode",
+    13: "refused: measured angle is far outside the joint limits, check the calibration",
 }
 
 
@@ -287,3 +381,84 @@ def decode_fault_bits(bits: int) -> str:
         if bits & (1 << bit):
             names.append(FAULT_BIT_NAMES.get(bit, f"BIT{bit}"))
     return ",".join(names)
+
+
+def pack_calibration(operation: int, joint: int, direction: int = 1, reference: int = 0) -> bytes:
+    return struct.pack(CALIBRATION_FORMAT, operation, joint, direction, reference)
+
+
+def unpack_calibration(payload: bytes) -> Optional[tuple[int, int, int, int]]:
+    """Returns (operation, joint, direction, reference), or None if the size is wrong."""
+    if len(payload) != CALIBRATION_PAYLOAD_SIZE:
+        return None
+    return struct.unpack(CALIBRATION_FORMAT, payload)
+
+
+def pack_joint_target(joint: int, angle_cdeg: int) -> bytes:
+    return struct.pack(JOINT_TARGET_FORMAT, joint, angle_cdeg)
+
+
+def unpack_joint_target(payload: bytes) -> Optional[tuple[int, int]]:
+    """Returns (joint, angle_cdeg), or None if the size is wrong."""
+    if len(payload) != JOINT_TARGET_PAYLOAD_SIZE:
+        return None
+    return struct.unpack(JOINT_TARGET_FORMAT, payload)
+
+
+def pack_speed_limit(speed_ddeg_s: int) -> bytes:
+    return struct.pack(SPEED_LIMIT_FORMAT, speed_ddeg_s)
+
+
+def unpack_speed_limit(payload: bytes) -> Optional[int]:
+    if len(payload) != SPEED_LIMIT_PAYLOAD_SIZE:
+        return None
+    return struct.unpack(SPEED_LIMIT_FORMAT, payload)[0]
+
+
+def pack_fault(fault: int, joint: int, value: int) -> bytes:
+    return struct.pack(FAULT_FORMAT, fault, joint, value)
+
+
+def unpack_fault(payload: bytes) -> Optional[tuple[int, int, int]]:
+    """Returns (fault bit, joint, value), or None if the size is wrong."""
+    if len(payload) != FAULT_PAYLOAD_SIZE:
+        return None
+    return struct.unpack(FAULT_FORMAT, payload)
+
+
+def pack_joint_status(
+    speed_limit_ddeg_s: int, joints: Sequence[tuple[int, int, int, int]]
+) -> bytes:
+    """JOINT_STATUS payload from the speed limit and 8 (flags, block, reference, target_cdeg)."""
+    if len(joints) != NUM_JOINTS:
+        raise ValueError(f"expected {NUM_JOINTS} joints, got {len(joints)}")
+    payload = struct.pack("<H", speed_limit_ddeg_s)
+    return payload + b"".join(struct.pack(JOINT_STATUS_ENTRY_FORMAT, *joint) for joint in joints)
+
+
+def unpack_joint_status(payload: bytes) -> Optional[tuple[int, list[tuple[int, int, int, int]]]]:
+    """Returns (speed limit in 0.1 deg/s, 8 x (flags, block, reference, target_cdeg)), or None
+    if the size is wrong."""
+    if len(payload) != JOINT_STATUS_PAYLOAD_SIZE:
+        return None
+    speed_limit = struct.unpack("<H", payload[:2])[0]
+    return speed_limit, list(struct.iter_unpack(JOINT_STATUS_ENTRY_FORMAT, payload[2:]))
+
+
+def pack_ack(command: int, result: int, joint: int, value: int) -> bytes:
+    return struct.pack(ACK_FORMAT, command, result, joint, value)
+
+
+def unpack_ack(payload: bytes) -> Optional[tuple[int, int, int, int]]:
+    """Returns (command, result, joint, value), or None if the size is wrong."""
+    if len(payload) != ACK_PAYLOAD_SIZE:
+        return None
+    return struct.unpack(ACK_FORMAT, payload)
+
+
+def joint_label(joint: int) -> str:
+    return JOINT_ORDER[joint] if 0 <= joint < NUM_JOINTS else "-"
+
+
+def ack_result_name(result: int) -> str:
+    return ACK_RESULT_NAMES.get(result, f"result {result}")
